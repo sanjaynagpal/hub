@@ -1,0 +1,12 @@
+# Keep the build context tiny and reproducible.
+mavenrepo
+mavenrepo-*
+*.exe
+repo/
+testrepo/
+data/
+*.log
+docs/
+README.md
+.git/
+.gitignore

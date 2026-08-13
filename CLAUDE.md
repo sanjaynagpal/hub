@@ -1,0 +1,97 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+## What this is
+
+`hub` (module `github.com/sanjaynagpal/hub`) is a single-file Maven repository
+server written in Go, standard library only — no third-party dependencies.
+Everything lives in `main.go` (~540 lines) plus `main_test.go`. There is no
+`internal/`, `pkg/`, or multi-package structure to navigate; read `main.go`
+directly.
+
+## Commands
+
+```bash
+go build -o mavenrepo .        # build
+go run . -addr :8080 -root ./repo   # run locally
+go test ./...                  # run all tests
+go test -run TestSnapshotMetadataRegeneration ./...   # run a single test
+go vet ./...
+```
+
+Cross-compiling (no target-host toolchain needed):
+
+```bash
+GOOS=linux GOARCH=amd64 go build -o mavenrepo-linux-amd64 .
+GOOS=linux GOARCH=arm64 go build -o mavenrepo-linux-arm64 .
+```
+
+Docker (multi-stage, static binary into `FROM scratch`, non-root uid 65532):
+
+```bash
+docker build -t hub .
+docker run -d --name hub -p 8080:8080 -v hub-repo:/repo hub -user deployer -pass s3cret
+```
+
+## Architecture
+
+The whole server is one `http.HandlerFunc` (`newHandler` in main.go) dispatching
+on method:
+
+- `GET`/`HEAD` → delegated straight to `http.FileServer(http.Dir(repoRoot))`
+  (directory listing comes for free from the stdlib).
+- `PUT` → `handlePut`: writes the uploaded file, then triggers metadata
+  regeneration.
+- `DELETE` → `handleDelete`: removes a file.
+
+Auth (`authOK`) is HTTP Basic, checked only for writes unless `-read-auth` is
+set; comparisons use `crypto/subtle` to stay constant-time. All writes go
+through a single package-level `mu sync.Mutex` (serializes writes and metadata
+regeneration so concurrent `mvn deploy`s can't race the snapshot build number).
+
+**Path safety**: every request path is resolved through `safePath`, which
+`filepath.Clean`s and joins against `repoRoot`, then verifies the result is
+still under `repoRoot` before any file I/O — this is the sole path-traversal
+guard and any new handler touching the filesystem must go through it.
+
+### Metadata regeneration (the core logic)
+
+The server treats itself as authoritative for `maven-metadata.xml` — client
+uploads of that file (and its checksums) are silently discarded and
+regenerated from what's actually on disk instead (`isMetadataName` check in
+`handlePut`). This is the main non-obvious piece of behavior in the codebase:
+
+- After any artifact `PUT`, `regenerateForArtifact` walks up from the file:
+  the immediate parent is always a version directory. If that version ends in
+  `-SNAPSHOT`, `regenSnapshot` rebuilds the version-level metadata (`<snapshot>`
+  timestamp/buildNumber and `<snapshotVersions>` list); `regenArtifact` always
+  runs one level up to rebuild the artifact-level `<versions>`/`<latest>`/`<release>`.
+- `regenSnapshot` recognizes two on-disk naming schemes for snapshot artifacts
+  via two regexes: the standard timestamped/unique-version form
+  (`artifact-base-yyyyMMdd.HHmmss-build[-classifier].ext`) and literal
+  `-SNAPSHOT` filenames. It picks whichever files match the *newest*
+  timestamp+build, dedupes by classifier+extension, and writes matching
+  `<snapshotVersion>` entries.
+- `regenArtifact` lists version subdirectories (via `dirHasArtifact`, which
+  ignores metadata/checksum files so empty-of-real-content dirs don't count),
+  orders them with `compareVersion` (a Maven-ish numeric/qualifier version
+  comparator — `-SNAPSHOT` sorts before its release), and picks `latest`
+  (last in order) and `release` (last non-`-SNAPSHOT`).
+- Every metadata write goes through `writeMeta`, which also writes matching
+  `.md5`/`.sha1` sidecars (`writeChecksums`) so checksum-verifying clients
+  stay happy.
+
+When modifying metadata behavior, the four functions to keep in sync are
+`regenerateForArtifact`/`regenerateForDir` (when regeneration is triggered)
+and `regenSnapshot`/`regenArtifact` (what gets written) — tests in
+`main_test.go` cover both the unique-version and literal-`-SNAPSHOT` layouts,
+build-number advancement, artifact-level `latest`/`release` selection, and
+checksum consistency, so run `go test ./...` after any change here.
+
+## Docs
+
+`docs/maven-repo-runbook.md` is a broader runbook comparing this Go server
+against Jetty and Sonatype Nexus Repository as alternatives for hosting a
+Maven repo — useful background if asked about scope/limitations or
+alternative approaches, not something the code depends on.

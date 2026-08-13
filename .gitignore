@@ -1,0 +1,13 @@
+# Build output
+/mavenrepo
+/mavenrepo-*
+*.exe
+
+# Local repository data / test dirs created at runtime
+/repo/
+/testrepo/
+/data/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db

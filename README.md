@@ -1,0 +1,138 @@
+# hub — a tiny single-binary Maven repository server
+
+`hub` is a minimal Maven repository server written in Go (standard library only,
+no third-party dependencies). It serves a directory tree over HTTP so it can act
+as a small Maven repository:
+
+- **GET / HEAD** — download artifacts, with directory listing (repository consumption)
+- **PUT** — accept artifact uploads, creating parent directories (`mvn deploy`)
+- **DELETE** — remove an artifact
+
+Writes (`PUT`/`DELETE`) can be gated behind HTTP Basic auth while reads stay
+anonymous — the common shape for an internal repo. It compiles to a single
+static binary with no runtime to pre-install.
+
+## Build
+
+```bash
+go build -o mavenrepo .
+```
+
+Cross-compile for another server with no toolchain on the target:
+
+```bash
+GOOS=linux  GOARCH=amd64 go build -o mavenrepo-linux-amd64 .
+GOOS=linux  GOARCH=arm64 go build -o mavenrepo-linux-arm64 .
+```
+
+## Run
+
+```bash
+# Anonymous read, authenticated write:
+./mavenrepo -addr :8080 -root /opt/maven-repo -user deployer -pass s3cret
+```
+
+| Flag         | Default   | Meaning                                        |
+|--------------|-----------|------------------------------------------------|
+| `-addr`      | `:8080`   | Listen address                                 |
+| `-root`      | `./repo`  | Repository root directory                      |
+| `-user`      | *(empty)* | Username required for writes (empty = open)    |
+| `-pass`      | *(empty)* | Password required for writes                   |
+| `-read-auth` | `false`   | Also require auth for reads (GET/HEAD)         |
+
+## Docker
+
+The repo ships a multi-stage `Dockerfile` that builds a fully static binary and
+copies it into a `FROM scratch` image (no OS, ~6 MB, runs as a non-root numeric
+user):
+
+```bash
+docker build -t hub .
+
+# Named volume for persistence; add -user/-pass by appending to the command:
+docker run -d --name hub -p 8080:8080 -v hub-repo:/repo hub -user deployer -pass s3cret
+```
+
+The container listens on `:8080` and stores artifacts in the `/repo` volume. The
+`ENTRYPOINT` is the server, so any flags you append to `docker run ... hub` are
+passed straight to it.
+
+## Use from Maven
+
+**Consume** — in a project `pom.xml` or `~/.m2/settings.xml`:
+
+```xml
+<repositories>
+  <repository>
+    <id>hub</id>
+    <url>http://YOUR_HOST:8080/</url>
+    <releases><enabled>true</enabled></releases>
+    <snapshots><enabled>true</enabled></snapshots>
+  </repository>
+</repositories>
+```
+
+**Deploy** — in a project `pom.xml`:
+
+```xml
+<distributionManagement>
+  <repository>
+    <id>hub</id>
+    <url>http://YOUR_HOST:8080/</url>
+  </repository>
+  <snapshotRepository>
+    <id>hub</id>
+    <url>http://YOUR_HOST:8080/</url>
+  </snapshotRepository>
+</distributionManagement>
+```
+
+with matching credentials in `settings.xml`:
+
+```xml
+<servers>
+  <server>
+    <id>hub</id>
+    <username>deployer</username>
+    <password>s3cret</password>
+  </server>
+</servers>
+```
+
+```bash
+mvn deploy
+```
+
+## Snapshot & metadata handling
+
+The server is **authoritative** for `maven-metadata.xml`. After each artifact
+upload it regenerates the affected metadata from the files actually present on
+disk, rather than trusting whatever the client uploads:
+
+- **Snapshot versions** (`…/<version>-SNAPSHOT/maven-metadata.xml`): the
+  `<snapshot>` timestamp / `<buildNumber>` and the `<snapshotVersions>` list are
+  rebuilt from the timestamped artifacts on disk, so `mvn deploy` of `-SNAPSHOT`
+  builds resolves correctly and the build number advances on its own. Both the
+  standard unique-version (timestamped) layout and literal `-SNAPSHOT` filenames
+  are recognised.
+- **Artifact versions** (`…/<artifactId>/maven-metadata.xml`): the `<versions>`
+  list plus `<latest>` and `<release>` are rebuilt from the version directories
+  present, using a Maven-ish version ordering (so `-SNAPSHOT` sorts before the
+  corresponding release).
+
+Matching `.md5` and `.sha1` checksums are written next to each metadata file so
+checksum-verifying clients stay happy, writes are serialized with a mutex so
+concurrent deploys can't race on the build number, and client-uploaded
+`maven-metadata.xml` (and its checksums) are ignored in favour of the server's
+regenerated copy.
+
+## Scope & limitations
+
+Still intentionally minimal. It does **not** proxy or cache Maven Central, has no
+web UI or fine-grained RBAC, and rebuilds metadata by scanning the version
+directory on each write (perfectly fine for small/medium repos, but not tuned for
+very large ones). For those capabilities use a full repository manager — see
+[`docs/maven-repo-runbook.md`](docs/maven-repo-runbook.md), which also covers the
+embedded/standalone **Jetty** alternatives and when to reach for **Sonatype Nexus
+Repository**. Put TLS (nginx/Caddy) in front before exposing it — Basic auth over
+plaintext is not enough.
