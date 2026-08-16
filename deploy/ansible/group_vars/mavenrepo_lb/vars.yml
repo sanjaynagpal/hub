@@ -1,0 +1,7 @@
+---
+# Only read for hosts in the mavenrepo_lb group (see inventory.ini) -- has no
+# effect on the current single-host deployment, which doesn't populate that
+# group.
+
+mavenrepo_lb_port: 443
+mavenrepo_lb_backend_port: 443

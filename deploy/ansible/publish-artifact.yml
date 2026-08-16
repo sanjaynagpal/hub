@@ -1,0 +1,107 @@
+---
+# Publishes one artifact version onto a read-only mavenrepo host by placing
+# files directly on disk (mavenrepo's PUT is switched off when
+# mavenrepo_read_only: true -- see group_vars/mavenrepo_servers/vars.yml),
+# then regenerating that artifact's maven-metadata.xml with `mavenrepo -regen`
+# so <latest>/<release>/<versions> pick up the new version. Checksums are
+# generated for each file too, matching what `mvn deploy` would've produced.
+#
+# Run with -e (or a vars file) supplying the coordinate and local files, e.g.
+# the scenario this was written for -- operator downloads erlang/otp and
+# publishes it as org.erlang:otp:26.2.5.11 (groupId "org.erlang", artifactId
+# "otp" -- Maven always needs both segments; "org.erlang.otp" as one string
+# splits into those two however your namespacing convention wants):
+#
+#   ansible-playbook publish-artifact.yml \
+#     -e mvn_group_id=org.erlang \
+#     -e mvn_artifact_id=otp \
+#     -e mvn_version=26.2.5.11 \
+#     -e '{"source_files": [
+#           {"src": "/home/operator/downloads/otp-26.2.5.11.tar.gz", "dest": "otp-26.2.5.11.tar.gz"},
+#           {"src": "/home/operator/downloads/otp-26.2.5.11.pom",    "dest": "otp-26.2.5.11.pom"}
+#         ]}'
+#
+# Or put the same into a YAML vars file and pass -e @path/to/vars.yml.
+
+- name: Publish one artifact version to a mavenrepo host
+  hosts: mavenrepo_servers
+  become: true
+
+  vars:
+    mvn_group_path: "{{ mvn_group_id | replace('.', '/') }}"
+    mvn_version_dir: "{{ mavenrepo_data_dir }}/{{ mvn_group_path }}/{{ mvn_artifact_id }}/{{ mvn_version }}"
+
+  tasks:
+    - name: Require the coordinate and file list
+      ansible.builtin.assert:
+        that:
+          - mvn_group_id is defined
+          - mvn_artifact_id is defined
+          - mvn_version is defined
+          - source_files is defined
+          - source_files | length > 0
+        fail_msg: "Pass mvn_group_id, mvn_artifact_id, mvn_version, and source_files -- see the header of this playbook for an example."
+
+    - name: Create the version directory
+      ansible.builtin.file:
+        path: "{{ mvn_version_dir }}"
+        state: directory
+        owner: "{{ mavenrepo_system_user }}"
+        group: "{{ mavenrepo_system_group }}"
+        mode: "0750"
+
+    - name: Checksum each local file (sha1)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ item.src }}"
+        get_checksum: true
+        checksum_algorithm: sha1
+      loop: "{{ source_files }}"
+      register: sha1_stats
+
+    - name: Checksum each local file (md5)
+      delegate_to: localhost
+      become: false
+      ansible.builtin.stat:
+        path: "{{ item.src }}"
+        get_checksum: true
+        checksum_algorithm: md5
+      loop: "{{ source_files }}"
+      register: md5_stats
+
+    - name: Copy each artifact file into place
+      ansible.builtin.copy:
+        src: "{{ item.src }}"
+        dest: "{{ mvn_version_dir }}/{{ item.dest }}"
+        owner: "{{ mavenrepo_system_user }}"
+        group: "{{ mavenrepo_system_group }}"
+        mode: "0644"
+      loop: "{{ source_files }}"
+
+    - name: Write sha1 sidecars
+      ansible.builtin.copy:
+        content: "{{ item.stat.checksum }}"
+        dest: "{{ mvn_version_dir }}/{{ item.item.dest }}.sha1"
+        owner: "{{ mavenrepo_system_user }}"
+        group: "{{ mavenrepo_system_group }}"
+        mode: "0644"
+      loop: "{{ sha1_stats.results }}"
+
+    - name: Write md5 sidecars
+      ansible.builtin.copy:
+        content: "{{ item.stat.checksum }}"
+        dest: "{{ mvn_version_dir }}/{{ item.item.dest }}.md5"
+        owner: "{{ mavenrepo_system_user }}"
+        group: "{{ mavenrepo_system_group }}"
+        mode: "0644"
+      loop: "{{ md5_stats.results }}"
+
+    - name: Regenerate maven-metadata.xml for this artifact
+      ansible.builtin.command:
+        cmd: >-
+          {{ mavenrepo_install_dir }}/bin/mavenrepo
+          -root {{ mavenrepo_data_dir }}
+          -regen {{ mvn_group_path }}/{{ mvn_artifact_id }}/{{ mvn_version }}
+      become_user: "{{ mavenrepo_system_user }}"
+      changed_when: true

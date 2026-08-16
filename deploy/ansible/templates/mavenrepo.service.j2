@@ -1,0 +1,19 @@
+[Unit]
+Description=mavenrepo -- single-binary Maven repository server
+After=network.target
+
+[Service]
+Type=simple
+User={{ mavenrepo_system_user }}
+Group={{ mavenrepo_system_group }}
+ExecStart={{ mavenrepo_install_dir }}/bin/mavenrepo -addr 127.0.0.1:{{ mavenrepo_bind_port }} -root {{ mavenrepo_data_dir }}{{ '' if mavenrepo_read_only else ' -user ' + mavenrepo_deploy_user + ' -pass-file ' + mavenrepo_install_dir + '/secrets/pass' }}{{ ' -read-auth' if mavenrepo_read_auth else '' }}{{ ' -read-only' if mavenrepo_read_only else '' }}
+Restart=on-failure
+RestartSec=2
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths={{ mavenrepo_data_dir }}
+
+[Install]
+WantedBy=multi-user.target

@@ -8,6 +8,11 @@
 /testrepo/
 /data/
 
+# Ansible: never commit a decrypted vault, or the cross-compiled binary
+# the playbook builds locally before copying it to target hosts.
+/deploy/ansible/group_vars/**/vault.yml
+/deploy/ansible/files/mavenrepo-linux-*
+
 # OS / editor cruft
 .DS_Store
 Thumbs.db

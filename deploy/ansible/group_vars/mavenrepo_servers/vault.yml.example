@@ -1,0 +1,21 @@
+---
+# Copy this file to vault.yml (same directory), fill in real values, then
+# encrypt it before it's ever committed:
+#
+#   cp vault.yml.example vault.yml
+#   $EDITOR vault.yml
+#   ansible-vault encrypt vault.yml
+#
+# group_vars/<group>/*.yml all load automatically for hosts in that group, so
+# an encrypted vault.yml sitting next to vars.yml is picked up with no extra
+# wiring -- just pass --ask-vault-pass (or --vault-password-file) when running
+# the playbook. vault.yml itself is gitignored so a decrypted copy is never
+# committed by accident.
+
+# Only read when mavenrepo_read_only is false (see vars.yml) -- a fully
+# read-only host never provisions write credentials at all.
+mavenrepo_deploy_user: deployer
+mavenrepo_deploy_password: CHANGE_ME
+
+# Only read when mavenrepo_tls_mode is internal_ca (see vars.yml).
+ca_api_token: CHANGE_ME

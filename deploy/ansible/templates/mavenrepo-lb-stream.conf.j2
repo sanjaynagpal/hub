@@ -1,0 +1,24 @@
+# Managed by Ansible -- TCP-passthrough load balancer in front of the
+# mavenrepo_servers backend hosts. TLS is NOT terminated here: each backend's
+# own nginx (templates/mavenrepo.conf.j2) still does that and still enforces
+# `limit_except GET HEAD`. This block only picks a healthy backend and
+# proxies the raw TCP/TLS bytes through untouched -- the backend still sees
+# the real client's TLS handshake and serves the same cert it always did.
+#
+# Health checks here are passive only (mark a peer down after max_fails
+# failed connection attempts within fail_timeout) -- open-source nginx has no
+# active health checks; that needs nginx Plus or a third-party module.
+
+upstream mavenrepo_backends {
+{% for host in groups['mavenrepo_servers'] %}
+    server {{ hostvars[host].ansible_host | default(host) }}:{{ mavenrepo_lb_backend_port }} max_fails=2 fail_timeout=10s;
+{% endfor %}
+}
+
+server {
+    listen {{ mavenrepo_lb_port }};
+    listen [::]:{{ mavenrepo_lb_port }};
+    proxy_pass mavenrepo_backends;
+    proxy_connect_timeout 3s;
+    proxy_timeout 10s;
+}

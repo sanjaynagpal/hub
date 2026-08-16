@@ -47,7 +47,10 @@ func main() {
 	root := flag.String("root", "./repo", "repository root directory")
 	user := flag.String("user", "", "username required for writes (empty = writes open)")
 	pass := flag.String("pass", "", "password required for writes")
+	passFile := flag.String("pass-file", "", "path to a file containing the write password (overrides -pass; keeps the secret out of argv and unit files)")
 	readAuth := flag.Bool("read-auth", false, "also require auth for reads (GET/HEAD)")
+	readOnly := flag.Bool("read-only", false, "reject PUT/DELETE outright (405), regardless of credentials -- for repos populated out-of-band instead of via mvn deploy")
+	regen := flag.String("regen", "", "regenerate maven-metadata.xml for the given version directory (path relative to -root) and exit immediately, without starting the server -- use after placing artifact files directly on disk")
 	flag.Parse()
 
 	abs, err := filepath.Abs(*root)
@@ -59,15 +62,36 @@ func main() {
 	}
 	repoRoot = abs
 
+	if *regen != "" {
+		target, ok := safePath("/" + *regen)
+		if !ok {
+			log.Fatalf("-regen path escapes -root")
+		}
+		if info, err := os.Stat(target); err != nil || !info.IsDir() {
+			log.Fatalf("-regen path must be an existing directory under -root: %v", err)
+		}
+		regenerateForVersionDir(target)
+		return
+	}
+
+	resolvedPass, err := resolvePassword(*pass, *passFile)
+	if err != nil {
+		log.Fatalf("reading pass-file: %v", err)
+	}
+
 	log.Printf("maven repo serving %s on %s (snapshot-aware metadata enabled)", repoRoot, *addr)
-	log.Fatal(http.ListenAndServe(*addr, newHandler(*user, *pass, *readAuth)))
+	log.Fatal(http.ListenAndServe(*addr, newHandler(*user, resolvedPass, *readAuth, *readOnly)))
 }
 
 // newHandler builds the HTTP handler. repoRoot must be set before calling.
-func newHandler(user, pass string, readAuth bool) http.Handler {
+func newHandler(user, pass string, readAuth, readOnly bool) http.Handler {
 	fileServer := http.FileServer(http.Dir(repoRoot))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		isWrite := r.Method == http.MethodPut || r.Method == http.MethodDelete
+		if readOnly && isWrite {
+			http.Error(w, "repository is read-only", http.StatusMethodNotAllowed)
+			return
+		}
 		if (isWrite || readAuth) && !authOK(r, user, pass) {
 			w.Header().Set("WWW-Authenticate", `Basic realm="maven"`)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -154,6 +178,18 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// resolvePassword returns passFile's trimmed contents when set, else pass as-is.
+func resolvePassword(pass, passFile string) (string, error) {
+	if passFile == "" {
+		return pass, nil
+	}
+	data, err := os.ReadFile(passFile)
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
 func authOK(r *http.Request, user, pass string) bool {
 	if user == "" {
 		return true
@@ -182,11 +218,16 @@ func isChecksumOrSig(name string) bool {
 }
 
 // regenerateForArtifact is called after an artifact file lands. The file's parent
-// is always the version dir, so refresh the version-level snapshot metadata (when
-// that dir is a -SNAPSHOT) and always the artifact-level versions metadata one
-// level up.
+// is always the version dir, so hand off to regenerateForVersionDir.
 func regenerateForArtifact(artifactFile string) {
-	verDir := filepath.Dir(artifactFile)
+	regenerateForVersionDir(filepath.Dir(artifactFile))
+}
+
+// regenerateForVersionDir refreshes the version-level snapshot metadata (when
+// verDir is a -SNAPSHOT) and always the artifact-level versions metadata one
+// level up. Also used by -regen for artifacts placed directly on disk instead
+// of via PUT, where nothing has triggered regeneration yet.
+func regenerateForVersionDir(verDir string) {
 	if strings.HasSuffix(filepath.Base(verDir), "-SNAPSHOT") {
 		regenSnapshot(verDir)
 	}

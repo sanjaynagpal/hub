@@ -1,0 +1,30 @@
+---
+mavenrepo_domain: mvn-dev-repo.slab.com
+
+mavenrepo_bind_port: 8080
+mavenrepo_install_dir: /opt/mavenrepo
+mavenrepo_data_dir: /var/lib/mavenrepo/repo
+mavenrepo_system_user: mavenrepo
+mavenrepo_system_group: mavenrepo
+mavenrepo_read_auth: false
+
+# Settled decision, not a placeholder default: `mvn deploy` credential
+# management (rotation, distribution to every developer/CI job, revocation)
+# doesn't pay for itself at this repo's actual write volume -- an operator
+# publishing an occasional vetted artifact. So PUT/DELETE stay switched off
+# entirely, both at mavenrepo (-read-only, rejects regardless of credentials)
+# and at nginx (limit_except in mavenrepo.conf.j2, belt and suspenders against
+# app-level config drift). Writes only ever happen through this Ansible
+# control node placing files directly and then running `mavenrepo -regen` to
+# rebuild metadata (see publish-artifact.yml). Only flip this to false if
+# `mvn deploy` credential management stops being the harder problem.
+mavenrepo_read_only: true
+
+# self_signed: fine for a dev repo, nothing external trusts it, matches how
+#   this was validated locally before the CA integration existed.
+# internal_ca: switch to this once the CA API's real request/response shape
+#   is filled in in deploy/nginx/renew-cert.sh (currently has TODOs).
+mavenrepo_tls_mode: self_signed
+mavenrepo_self_signed_days: 825
+
+ca_endpoint: "https://ca.internal.example.com/api/v1/sign-csr"

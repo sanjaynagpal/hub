@@ -1,0 +1,8 @@
+[Unit]
+Description=Renew mavenrepo TLS certificate from internal CA
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/renew-cert.sh

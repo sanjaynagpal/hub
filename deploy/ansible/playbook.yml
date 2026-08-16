@@ -1,0 +1,260 @@
+---
+# Deploys mavenrepo (as a systemd service on loopback) + nginx (TLS
+# termination + reverse proxy) to every host in the mavenrepo_servers group.
+# See README.md in this directory for variables, vault setup, and how to run.
+
+- name: Cross-compile the mavenrepo binary for the fleet's architecture
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: Check for a Go toolchain on the control node
+      ansible.builtin.command: go version
+      register: go_check
+      failed_when: false
+      changed_when: false
+
+    - name: Fail with a clear message if Go isn't installed
+      ansible.builtin.fail:
+        msg: >-
+          `go` was not found on PATH on the control node ({{ inventory_hostname }}).
+          This playbook cross-compiles the binary locally rather than requiring
+          a Go toolchain on the target hosts -- install Go on the control node
+          first (https://go.dev/dl/) and re-run.
+      when: go_check.rc != 0
+
+    - name: go build linux/amd64
+      ansible.builtin.command:
+        cmd: go build -trimpath -ldflags="-s -w" -o {{ playbook_dir }}/files/mavenrepo-linux-amd64 .
+        chdir: "{{ playbook_dir }}/../.."
+      environment:
+        GOOS: linux
+        GOARCH: amd64
+        CGO_ENABLED: "0"
+      changed_when: true
+
+- name: Deploy mavenrepo behind an nginx TLS front
+  hosts: mavenrepo_servers
+  become: true
+
+  handlers:
+    - name: restart mavenrepo
+      ansible.builtin.systemd:
+        name: mavenrepo
+        state: restarted
+        daemon_reload: true
+
+    - name: reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+  tasks:
+    - name: Create mavenrepo system group
+      ansible.builtin.group:
+        name: "{{ mavenrepo_system_group }}"
+        system: true
+
+    - name: Create mavenrepo system user
+      ansible.builtin.user:
+        name: "{{ mavenrepo_system_user }}"
+        group: "{{ mavenrepo_system_group }}"
+        system: true
+        create_home: false
+        shell: /usr/sbin/nologin
+
+    - name: Create install, data, and secrets directories
+      ansible.builtin.file:
+        path: "{{ item.path }}"
+        state: directory
+        owner: "{{ mavenrepo_system_user }}"
+        group: "{{ mavenrepo_system_group }}"
+        mode: "{{ item.mode }}"
+      loop:
+        - { path: "{{ mavenrepo_install_dir }}/bin", mode: "0755" }
+        - { path: "{{ mavenrepo_data_dir }}", mode: "0750" }
+
+    - name: Create the secrets directory
+      ansible.builtin.file:
+        path: "{{ mavenrepo_install_dir }}/secrets"
+        state: directory
+        owner: "{{ mavenrepo_system_user }}"
+        group: "{{ mavenrepo_system_group }}"
+        mode: "0750"
+      when: not mavenrepo_read_only
+
+    - name: Write the write-auth password (kept off argv/unit files)
+      ansible.builtin.copy:
+        content: "{{ mavenrepo_deploy_password }}"
+        dest: "{{ mavenrepo_install_dir }}/secrets/pass"
+        owner: "{{ mavenrepo_system_user }}"
+        group: "{{ mavenrepo_system_group }}"
+        mode: "0600"
+      when: not mavenrepo_read_only
+      no_log: true
+      notify: restart mavenrepo
+
+    - name: Install the mavenrepo binary
+      ansible.builtin.copy:
+        src: mavenrepo-linux-amd64
+        dest: "{{ mavenrepo_install_dir }}/bin/mavenrepo"
+        owner: "{{ mavenrepo_system_user }}"
+        group: "{{ mavenrepo_system_group }}"
+        mode: "0755"
+      notify: restart mavenrepo
+
+    - name: Install the mavenrepo systemd unit
+      ansible.builtin.template:
+        src: mavenrepo.service.j2
+        dest: /etc/systemd/system/mavenrepo.service
+        mode: "0644"
+      notify: restart mavenrepo
+
+    - name: Enable and start mavenrepo
+      ansible.builtin.systemd:
+        name: mavenrepo
+        state: started
+        enabled: true
+        daemon_reload: true
+
+    - name: Install nginx
+      ansible.builtin.package:
+        name: nginx
+        state: present
+
+    - name: Create the TLS cert directory
+      ansible.builtin.file:
+        path: "/etc/nginx/certs/{{ mavenrepo_domain }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0750"
+
+    - name: Deploy the nginx vhost
+      ansible.builtin.template:
+        src: mavenrepo.conf.j2
+        dest: /etc/nginx/conf.d/mavenrepo.conf
+        mode: "0644"
+      notify: reload nginx
+
+    # ---- TLS: self-signed (default until the internal CA API is confirmed) ----
+    - name: Generate a self-signed cert
+      ansible.builtin.script:
+        cmd: "{{ playbook_dir }}/../nginx/gen-self-signed-cert.sh {{ mavenrepo_domain }} {{ mavenrepo_self_signed_days }}"
+        creates: "/etc/nginx/certs/{{ mavenrepo_domain }}/fullchain.pem"
+      when: mavenrepo_tls_mode == 'self_signed'
+      notify: reload nginx
+
+    # ---- TLS: internal CA (flip mavenrepo_tls_mode once the API is confirmed) ----
+    - name: Install the CA API auth token
+      ansible.builtin.copy:
+        content: "{{ ca_api_token }}"
+        dest: /etc/nginx/certs/ca-api-token
+        owner: root
+        group: root
+        mode: "0600"
+      when: mavenrepo_tls_mode == 'internal_ca'
+      no_log: true
+
+    - name: Install renew-cert.sh
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../nginx/renew-cert.sh"
+        dest: /usr/local/bin/renew-cert.sh
+        mode: "0750"
+      when: mavenrepo_tls_mode == 'internal_ca'
+
+    - name: Install the cert-renew systemd unit (per-host domain/endpoint)
+      ansible.builtin.template:
+        src: cert-renew.service.j2
+        dest: /etc/systemd/system/cert-renew.service
+        mode: "0644"
+      when: mavenrepo_tls_mode == 'internal_ca'
+
+    - name: Install the cert-renew timer
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../nginx/cert-renew.timer"
+        dest: /etc/systemd/system/cert-renew.timer
+        mode: "0644"
+      when: mavenrepo_tls_mode == 'internal_ca'
+
+    - name: Seed the initial CA-issued cert
+      ansible.builtin.command: /usr/local/bin/renew-cert.sh
+      args:
+        creates: "/etc/nginx/certs/{{ mavenrepo_domain }}/fullchain.pem"
+      environment:
+        DOMAIN: "{{ mavenrepo_domain }}"
+        CA_ENDPOINT: "{{ ca_endpoint }}"
+      when: mavenrepo_tls_mode == 'internal_ca'
+      notify: reload nginx
+
+    - name: Enable the cert-renew timer
+      ansible.builtin.systemd:
+        name: cert-renew.timer
+        state: started
+        enabled: true
+        daemon_reload: true
+      when: mavenrepo_tls_mode == 'internal_ca'
+
+    - name: Enable and start nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true
+
+# ---- Optional: TCP-passthrough load balancer -------------------------------
+# Matches zero hosts (and does nothing) unless the mavenrepo_lb group is
+# populated in inventory.ini -- see README.md's "Optional: two-backend HA
+# with a load balancer" section before enabling this.
+- name: Deploy the mavenrepo load balancer (TCP passthrough, no TLS termination)
+  hosts: mavenrepo_lb
+  become: true
+
+  handlers:
+    - name: reload nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: reloaded
+
+  tasks:
+    - name: Install nginx
+      ansible.builtin.package:
+        name: nginx
+        state: present
+
+    - name: Install the stream module (Debian/Ubuntu split it out of the base package)
+      ansible.builtin.package:
+        name: libnginx-mod-stream
+        state: present
+      when: ansible_os_family == 'Debian'
+
+    - name: Enable the stream context in nginx.conf
+      ansible.builtin.blockinfile:
+        path: /etc/nginx/nginx.conf
+        marker: "# {mark} ANSIBLE MANAGED BLOCK -- mavenrepo stream context"
+        insertafter: EOF
+        block: |
+          stream {
+              include /etc/nginx/stream.d/*.conf;
+          }
+      notify: reload nginx
+
+    - name: Create the stream config directory
+      ansible.builtin.file:
+        path: /etc/nginx/stream.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Deploy the load balancer stream config
+      ansible.builtin.template:
+        src: mavenrepo-lb-stream.conf.j2
+        dest: /etc/nginx/stream.d/mavenrepo-lb.conf
+        mode: "0644"
+      notify: reload nginx
+
+    - name: Enable and start nginx
+      ansible.builtin.systemd:
+        name: nginx
+        state: started
+        enabled: true

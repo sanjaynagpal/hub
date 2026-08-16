@@ -91,7 +91,20 @@ checksum consistency, so run `go test ./...` after any change here.
 
 ## Docs
 
-`docs/maven-repo-runbook.md` is a broader runbook comparing this Go server
-against Jetty and Sonatype Nexus Repository as alternatives for hosting a
-Maven repo — useful background if asked about scope/limitations or
-alternative approaches, not something the code depends on.
+- `docs/maven-repo-runbook.md` — broader runbook comparing this Go server
+  against Jetty and Sonatype Nexus Repository as alternatives for hosting a
+  Maven repo — useful background if asked about scope/limitations or
+  alternative approaches.
+- `docs/architecture.md` — architecture doc for the `mvn-dev-repo.slab.com`
+  deployment specifically: component breakdown, the `-read-only` +
+  operator-publish design decision and why `mvn deploy` credentials were
+  rejected for this host, and open items (pending internal-CA integration,
+  etc).
+- `docs/operator-runbook.md` — task-oriented ops guide for that same
+  deployment: first-time setup, publishing/removing an artifact via
+  `deploy/ansible/publish-artifact.yml`, cert renewal, troubleshooting.
+
+None of these three are something the code depends on, but `architecture.md`
+and `operator-runbook.md` describe `-read-only`/`-regen` (main.go flags) and
+the Ansible layout under `deploy/`, so re-check them for accuracy if either
+changes.

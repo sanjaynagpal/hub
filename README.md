@@ -38,7 +38,10 @@ GOOS=linux  GOARCH=arm64 go build -o mavenrepo-linux-arm64 .
 | `-root`      | `./repo`  | Repository root directory                      |
 | `-user`      | *(empty)* | Username required for writes (empty = open)    |
 | `-pass`      | *(empty)* | Password required for writes                   |
+| `-pass-file` | *(empty)* | Path to a file holding the password; overrides `-pass` and keeps it out of argv/unit files (e.g. for systemd deployments) |
 | `-read-auth` | `false`   | Also require auth for reads (GET/HEAD)         |
+| `-read-only` | `false`   | Reject PUT/DELETE outright (405) regardless of credentials — for repos populated out-of-band instead of via `mvn deploy` |
+| `-regen`     | *(empty)* | Regenerate `maven-metadata.xml` for the given version directory (relative to `-root`) and exit, without starting the server — for artifacts placed directly on disk |
 
 ## Docker
 
@@ -126,6 +129,31 @@ concurrent deploys can't race on the build number, and client-uploaded
 `maven-metadata.xml` (and its checksums) are ignored in favour of the server's
 regenerated copy.
 
+## Read-only mode (artifacts published out-of-band)
+
+For repos that only ever hold artifacts an operator has vetted and placed
+manually — e.g. a third-party download not on Maven Central — rather than
+anything `mvn deploy` pushes routinely, run with `-read-only`. PUT/DELETE are
+then rejected outright (405) regardless of credentials, not just auth-gated;
+GET/HEAD are unaffected. This sidesteps `mvn deploy` credential management
+(distribution, rotation, revocation across every developer and CI job)
+entirely, which is real overhead not worth paying when writes are infrequent
+and operator-driven anyway. The Ansible deployment in
+[`deploy/ansible/`](deploy/ansible/) enforces this at nginx too (a
+`limit_except GET HEAD { deny all; }` block), so a write never even reaches
+the backend regardless of app-level config drift.
+
+Since a read-only server has no HTTP write path, artifacts have to land on
+disk some other way (e.g. an Ansible playbook copying files directly — see
+[`deploy/ansible/publish-artifact.yml`](deploy/ansible/publish-artifact.yml)
+for a working example). That bypasses the PUT handler entirely, so nothing
+triggers the metadata regeneration described below — run
+`mavenrepo -root <root> -regen <path/to/version/dir>` afterwards to rebuild
+that artifact's `maven-metadata.xml` from what's actually on disk. It's a
+one-shot CLI command (the server doesn't need to be running), and pairs
+naturally with `-read-only`: since HTTP can never write, `-regen` invocations
+are the only writer, so there's no race with the server's internal mutex.
+
 ## Scope & limitations
 
 Still intentionally minimal. It does **not** proxy or cache Maven Central, has no
@@ -134,5 +162,6 @@ directory on each write (perfectly fine for small/medium repos, but not tuned fo
 very large ones). For those capabilities use a full repository manager — see
 [`docs/maven-repo-runbook.md`](docs/maven-repo-runbook.md), which also covers the
 embedded/standalone **Jetty** alternatives and when to reach for **Sonatype Nexus
-Repository**. Put TLS (nginx/Caddy) in front before exposing it — Basic auth over
-plaintext is not enough.
+Repository**. Put TLS in front before exposing it — Basic auth over plaintext is
+not enough. [`deploy/nginx/`](deploy/nginx/) has a ready-made nginx reverse-proxy
++ TLS config (internal-CA REST API renewal instead of ACME/Let's Encrypt).

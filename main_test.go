@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -17,7 +18,7 @@ import (
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	repoRoot = t.TempDir()
-	srv := httptest.NewServer(newHandler("deployer", "s3cret", false))
+	srv := httptest.NewServer(newHandler("deployer", "s3cret", false, false))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -79,6 +80,96 @@ func TestAuthRequiredForWrite(t *testing.T) {
 	// Reads stay anonymous.
 	if code, _ := get(t, srv.URL, snapDir+"/x.jar"); code != http.StatusOK {
 		t.Fatalf("anonymous GET: got %d, want 200", code)
+	}
+}
+
+func TestResolvePasswordFromFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pass")
+	if err := os.WriteFile(path, []byte("s3cret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolvePassword("ignored", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "s3cret" {
+		t.Fatalf("got %q, want %q", got, "s3cret")
+	}
+}
+
+func TestResolvePasswordFallsBackToFlag(t *testing.T) {
+	got, err := resolvePassword("flagpass", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "flagpass" {
+		t.Fatalf("got %q, want %q", got, "flagpass")
+	}
+}
+
+func TestReadOnlyRejectsWrites(t *testing.T) {
+	repoRoot = t.TempDir()
+	srv := httptest.NewServer(newHandler("deployer", "s3cret", false, true))
+	t.Cleanup(srv.Close)
+
+	// Even with correct credentials, writes are rejected outright.
+	if code := put(t, srv.URL, snapDir+"/x.jar", "data", "deployer", "s3cret"); code != http.StatusMethodNotAllowed {
+		t.Fatalf("PUT on read-only server: got %d, want 405", code)
+	}
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/"+snapDir+"/x.jar", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("deployer", "s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusMethodNotAllowed {
+		t.Fatalf("DELETE on read-only server: got %d, want 405", resp.StatusCode)
+	}
+
+	// Reads still work.
+	if code, _ := get(t, srv.URL, "/"); code != http.StatusOK {
+		t.Fatalf("GET on read-only server: got %d, want 200", code)
+	}
+}
+
+// TestRegenerateForVersionDir covers the -regen CLI path: artifact files
+// placed directly on disk (bypassing PUT entirely, as a read-only repo
+// populated out-of-band would) still get correct artifact-level metadata
+// once regenerateForVersionDir is run against the version directory.
+func TestRegenerateForVersionDir(t *testing.T) {
+	repoRoot = t.TempDir()
+
+	verDir := filepath.Join(repoRoot, "org", "erlang", "otp", "26.2.5.11")
+	if err := os.MkdirAll(verDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(verDir, "otp-26.2.5.11.jar"), []byte("jar"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(verDir, "otp-26.2.5.11.pom"), []byte("<project/>"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	regenerateForVersionDir(verDir)
+
+	metaPath := filepath.Join(repoRoot, "org", "erlang", "otp", "maven-metadata.xml")
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("artifact-level maven-metadata.xml not written: %v", err)
+	}
+	m := parseMeta(t, string(data))
+	if m.Versioning.Latest != "26.2.5.11" {
+		t.Fatalf("latest: got %q, want 26.2.5.11", m.Versioning.Latest)
+	}
+	if m.Versioning.Release != "26.2.5.11" {
+		t.Fatalf("release: got %q, want 26.2.5.11", m.Versioning.Release)
+	}
+	if _, err := os.Stat(metaPath + ".sha1"); err != nil {
+		t.Fatalf("missing metadata checksum sidecar: %v", err)
 	}
 }
 
