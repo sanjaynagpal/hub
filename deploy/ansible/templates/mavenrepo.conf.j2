@@ -12,6 +12,9 @@ server {
     listen [::]:80;
     server_name {{ mavenrepo_domain }};
 
+    # Don't hand an attacker the exact nginx version for free.
+    server_tokens off;
+
     location / {
         return 301 https://$host$request_uri;
     }
@@ -21,6 +24,9 @@ server {
     listen 443 ssl http2;
     listen [::]:443 ssl http2;
     server_name {{ mavenrepo_domain }};
+
+    # Don't hand an attacker the exact nginx version for free.
+    server_tokens off;
 
     ssl_certificate     /etc/nginx/certs/{{ mavenrepo_domain }}/fullchain.pem;
     ssl_certificate_key /etc/nginx/certs/{{ mavenrepo_domain }}/privkey.pem;

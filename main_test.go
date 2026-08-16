@@ -325,6 +325,53 @@ func TestDelete(t *testing.T) {
 	}
 }
 
+func TestUploadSizeLimit(t *testing.T) {
+	repoRoot = t.TempDir()
+	orig := maxUploadSize
+	maxUploadSize = 8 // bytes
+	t.Cleanup(func() { maxUploadSize = orig })
+	srv := httptest.NewServer(newHandler("deployer", "s3cret", false, false))
+	t.Cleanup(srv.Close)
+
+	req, err := http.NewRequest(http.MethodPut, srv.URL+"/"+snapDir+"/x.jar", strings.NewReader("this body is way over the limit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("deployer", "s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized PUT: got %d, want 413", resp.StatusCode)
+	}
+	if _, err := os.Stat(filepath.Join(repoRoot, snapDir, "x.jar")); !os.IsNotExist(err) {
+		t.Fatalf("expected no partial file left behind, stat error: %v", err)
+	}
+}
+
+func TestDeleteErrorDoesNotLeakServerPath(t *testing.T) {
+	srv := newTestServer(t)
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/"+snapDir+"/does-not-exist.jar", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("deployer", "s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("DELETE missing file: got %d, want 404", resp.StatusCode)
+	}
+	b, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(b), repoRoot) {
+		t.Fatalf("error response leaked the server-side repo path: %s", b)
+	}
+}
+
 func TestSafePathContainsTraversal(t *testing.T) {
 	repoRoot = t.TempDir()
 	for _, p := range []string{"/../../etc/passwd", "/a/../../b", "/../.."} {

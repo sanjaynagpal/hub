@@ -23,6 +23,7 @@ import (
 	"crypto/subtle"
 	"encoding/hex"
 	"encoding/xml"
+	"errors"
 	"flag"
 	"io"
 	"log"
@@ -38,8 +39,9 @@ import (
 )
 
 var (
-	repoRoot string
-	mu       sync.Mutex // serializes writes + metadata regeneration
+	repoRoot      string
+	mu            sync.Mutex // serializes writes + metadata regeneration
+	maxUploadSize int64      // 0 = unlimited; set from -max-upload-size in main()
 )
 
 func main() {
@@ -51,7 +53,9 @@ func main() {
 	readAuth := flag.Bool("read-auth", false, "also require auth for reads (GET/HEAD)")
 	readOnly := flag.Bool("read-only", false, "reject PUT/DELETE outright (405), regardless of credentials -- for repos populated out-of-band instead of via mvn deploy")
 	regen := flag.String("regen", "", "regenerate maven-metadata.xml for the given version directory (path relative to -root) and exit immediately, without starting the server -- use after placing artifact files directly on disk")
+	maxUploadFlag := flag.Int64("max-upload-size", 500*1024*1024, "maximum PUT request body size in bytes, enforced by the server itself regardless of any reverse-proxy limit (0 = unlimited)")
 	flag.Parse()
+	maxUploadSize = *maxUploadFlag
 
 	abs, err := filepath.Abs(*root)
 	if err != nil {
@@ -80,7 +84,19 @@ func main() {
 	}
 
 	log.Printf("maven repo serving %s on %s (snapshot-aware metadata enabled)", repoRoot, *addr)
-	log.Fatal(http.ListenAndServe(*addr, newHandler(*user, resolvedPass, *readAuth, *readOnly)))
+	srv := &http.Server{
+		Addr:    *addr,
+		Handler: newHandler(*user, resolvedPass, *readAuth, *readOnly),
+		// ReadHeaderTimeout guards against slowloris-style connections that
+		// trickle headers in to hold a connection open indefinitely.
+		// ReadTimeout/WriteTimeout are deliberately left unset: they'd bound
+		// the *entire* request/response duration, which would cap large
+		// artifact uploads/downloads on a slow connection well below
+		// -max-upload-size's actual byte limit.
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+	log.Fatal(srv.ListenAndServe())
 }
 
 // newHandler builds the HTTP handler. repoRoot must be set before calling.
@@ -120,6 +136,14 @@ func safePath(urlPath string) (string, bool) {
 	return full, true
 }
 
+// writeError logs the real error server-side (with the request that caused
+// it) and returns only a generic message to the client, so internal details
+// like filesystem paths never leak into a response body.
+func writeError(w http.ResponseWriter, r *http.Request, status int, msg string, err error) {
+	log.Printf("%s %s: %s: %v", r.Method, r.URL.Path, msg, err)
+	http.Error(w, msg, status)
+}
+
 func handlePut(w http.ResponseWriter, r *http.Request) {
 	full, ok := safePath(r.URL.Path)
 	if !ok {
@@ -141,17 +165,27 @@ func handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "could not create directory", err)
 		return
 	}
 	f, err := os.Create(full)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		writeError(w, r, http.StatusInternalServerError, "could not create file", err)
 		return
 	}
-	if _, err := io.Copy(f, r.Body); err != nil {
+
+	body := io.Reader(r.Body)
+	if maxUploadSize > 0 {
+		body = http.MaxBytesReader(w, r.Body, maxUploadSize)
+	}
+	if _, err := io.Copy(f, body); err != nil {
 		f.Close()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		os.Remove(full) // don't leave a partial/truncated file behind
+		if _, ok := errors.AsType[*http.MaxBytesError](err); ok {
+			http.Error(w, "upload exceeds maximum allowed size", http.StatusRequestEntityTooLarge)
+			return
+		}
+		writeError(w, r, http.StatusInternalServerError, "upload failed", err)
 		return
 	}
 	f.Close()
@@ -172,7 +206,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 	mu.Lock()
 	defer mu.Unlock()
 	if err := os.Remove(full); err != nil {
-		http.Error(w, err.Error(), http.StatusNotFound)
+		writeError(w, r, http.StatusNotFound, "not found", err)
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)

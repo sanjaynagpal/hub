@@ -217,6 +217,13 @@ by itself open a write path.
 
 ## 7. Known gaps / open items
 
+- **Security hardening**: HTTP server timeouts, an app-layer upload size cap,
+  sanitized error responses (no server-side path leakage), and
+  `server_tokens off;` were reviewed and closed — see the README's "Security
+  hardening" section for the full list of what's implemented vs. still
+  open (no built-in access logging, no auth rate limiting, no `nosniff`
+  header). Path traversal was reviewed and confirmed guarded at both the
+  read (`http.Dir`) and write (`safePath`) paths.
 - **TLS**: currently self-signed (`mavenrepo_tls_mode: self_signed`,
   `deploy/nginx/gen-self-signed-cert.sh`), which is untrusted by any client
   by design. Migrating to the internal CA's REST API

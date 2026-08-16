@@ -42,6 +42,7 @@ GOOS=linux  GOARCH=arm64 go build -o mavenrepo-linux-arm64 .
 | `-read-auth` | `false`   | Also require auth for reads (GET/HEAD)         |
 | `-read-only` | `false`   | Reject PUT/DELETE outright (405) regardless of credentials — for repos populated out-of-band instead of via `mvn deploy` |
 | `-regen`     | *(empty)* | Regenerate `maven-metadata.xml` for the given version directory (relative to `-root`) and exit, without starting the server — for artifacts placed directly on disk |
+| `-max-upload-size` | `524288000` (500 MiB) | Maximum PUT request body size in bytes, enforced by the server itself regardless of any reverse-proxy limit (`0` = unlimited) |
 
 ## Docker
 
@@ -153,6 +154,35 @@ that artifact's `maven-metadata.xml` from what's actually on disk. It's a
 one-shot CLI command (the server doesn't need to be running), and pairs
 naturally with `-read-only`: since HTTP can never write, `-regen` invocations
 are the only writer, so there's no race with the server's internal mutex.
+
+## Security hardening
+
+**Path traversal**: fully guarded, at two independent layers. `GET`/`HEAD`
+goes through `http.FileServer(http.Dir(repoRoot))`, whose stdlib `http.Dir`
+rejects any path containing `..` outright. `PUT`/`DELETE`/`-regen` all
+resolve through `safePath()`, which `filepath.Clean`s (eliminating leading
+`..` on a rooted path) and joins against `repoRoot`, then verifies the result
+is still prefixed by `repoRoot` before any file I/O. Covered by
+`TestSafePathContainsTraversal`. Not covered: a symlink placed under
+`repoRoot` pointing outside it would be followed on `GET` — not exploitable
+through this server's own HTTP interface (`PUT` only ever writes literal file
+content, never a symlink), but worth knowing if something else on the host
+could plant one.
+
+**Implemented**:
+- Constant-time credential comparison (`crypto/subtle`) — no timing side channel on `-user`/`-pass`.
+- `-read-only` (see above) plus the nginx-level `limit_except` mirror in `deploy/ansible/`.
+- `-pass-file` keeps the write password off argv/`ps`/unit files.
+- `-max-upload-size` (default 500 MiB) caps `PUT` body size at the app layer via `http.MaxBytesReader`, independent of any reverse-proxy limit; a request over the cap gets 413 and no partial file is left on disk.
+- Explicit `ReadHeaderTimeout`/`IdleTimeout` on the HTTP server, guarding against slowloris-style connections that hold sockets open by trickling headers in slowly. `ReadTimeout`/`WriteTimeout` are deliberately left unset so they don't cap large legitimate artifact transfers.
+- Error responses to clients are generic; the real error (which can include server-side file paths) is logged server-side only, not returned in the response body.
+- `server_tokens off;` in the shipped nginx configs, so the exact nginx version isn't handed to anyone probing the server.
+
+**Not implemented, worth knowing about**:
+- No built-in request/access logging beyond the startup line and error paths — rely on nginx's access log (or add your own reverse-proxy logging) for a full audit trail of who read/wrote what.
+- No rate limiting on Basic Auth attempts at the app layer — add `limit_req` at nginx if `-read-only` is off and brute-forcing `-pass` is a real concern for your deployment.
+- Directory listing is on by default (`http.FileServer`'s built-in behavior) — expected for a browsable repo, but confirm that's actually wanted for your deployment; there's no flag to disable it.
+- No `X-Content-Type-Options: nosniff` — mostly relevant if the general-purpose write mode (`-read-only` off) is used by less-trusted principals, since a served `.html` upload could execute inline script for anyone linked directly to it.
 
 ## Scope & limitations
 
