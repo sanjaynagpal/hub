@@ -48,6 +48,8 @@ flowchart LR
         nginx["nginx<br/>TLS termination + reverse proxy<br/>GET/HEAD only enforced"]
         mavenrepo["mavenrepo (Go binary)<br/>systemd service, loopback-bound<br/>-read-only"]
         disk[("Repository filesystem<br/>/var/lib/mavenrepo/repo")]
+        acmeclient["acmeclient<br/>cert-renew.timer, daily"]
+        certs[("TLS cert files<br/>/etc/nginx/certs/...")]
     end
 
     subgraph "Ansible control node"
@@ -55,12 +57,20 @@ flowchart LR
         playbook["publish-artifact.yml"]
     end
 
+    ca["Internal CA<br/>ACME (RFC 8555) endpoint"]
+    notify["Notification hook<br/>(-notify-cmd, e.g. Slack)"]
+
     dev -- "HTTPS GET" --> nginx
     nginx -- "HTTP GET (loopback)" --> mavenrepo
     mavenrepo -- "read" --> disk
+    nginx -- "reads" --> certs
 
     operator -- "downloads artifact, runs playbook" --> playbook
     playbook -- "SSH: copy files, run mavenrepo -regen" --> disk
+
+    acmeclient -- "checks expiry; HTTP-01 challenge + issuance" --> ca
+    acmeclient -- "writes cert, reloads nginx" --> certs
+    acmeclient -- "renewal_upcoming / _succeeded / _failed" --> notify
 ```
 
 Two independent write paths into the filesystem were considered — HTTP `PUT`
@@ -155,11 +165,31 @@ host would need to think about more carefully.
 
 | File | Role |
 |---|---|
-| `playbook.yml` | Cross-compiles `linux/amd64` locally, installs the binary + systemd unit under a dedicated non-root `mavenrepo` system user, installs/configures nginx, provisions TLS (self-signed today, see §7) |
+| `playbook.yml` | Cross-compiles `linux/amd64` locally, installs the binary + systemd unit under a dedicated non-root `mavenrepo` system user, installs/configures nginx, provisions TLS (`self_signed` or `acme`, see §4.5/§7) |
 | `publish-artifact.yml` | The operator's actual artifact-publishing workflow (§5) |
-| `templates/*.j2` | systemd unit + nginx vhost, parameterized per-host |
-| `group_vars/mavenrepo_servers/vars.yml` | Non-secret host config, including `mavenrepo_read_only: true` |
-| `group_vars/mavenrepo_servers/vault.yml.example` | Template for vaulted secrets — unused for this host in its current (read-only) configuration |
+| `templates/*.j2` | systemd units (`mavenrepo`, `cert-renew`) + nginx vhost, parameterized per-host |
+| `group_vars/mavenrepo_servers/vars.yml` | Non-secret host config, including `mavenrepo_read_only: true` and the `acme_*` renewal/notification settings |
+| `group_vars/mavenrepo_servers/vault.yml.example` | Template for vaulted secrets — unused for this host in its current (read-only, self-signed) configuration |
+
+### 4.5 `cmd/acmeclient` (TLS provisioning)
+
+Independent single-file Go binary (`cmd/acmeclient/main.go`), same
+stdlib-only discipline as `mavenrepo` itself, but a separate build/binary —
+`mavenrepo` has no TLS of its own and is never expected to. Run daily via
+`cert-renew.timer` (systemd), it owns the certificate files nginx's
+`ssl_certificate`/`ssl_certificate_key` point at (§4.2).
+
+| Behavior | Detail |
+|---|---|
+| Issuance protocol | ACME (RFC 8555) via the HTTP-01 challenge, against `mavenrepo_tls_mode: acme`'s `acme_directory_url` — see [`acme-protocol.md`](acme-protocol.md) for the protocol itself |
+| Renewal trigger | Reads the *installed* certificate's actual `NotAfter` on every run and renews only within `-renew-before-days` (default 14) — not an assumed lifetime, so the same logic holds whether the CA issues day- or month-scale certificates |
+| Notifications | Optional `-notify-cmd` shell hook (e.g. a Slack webhook — see `deploy/nginx/notify-cert-renewal.sh.example`) fires once as a heads-up at `-notify-before-days` (default 21, deduplicated per certificate serial number), then again on each actual renewal's success or failure |
+| Escape hatch | `-force` (`acme_force_renew: true`) skips the expiry check and renews unconditionally on every run — the tool's original behavior, for operators who'd rather lean on the CA's own rate limiting than have this tool decide when to renew |
+
+Under the default (non-`-force`) mode, most daily timer runs are a local
+file read and a date comparison — no CA contact at all — which is what
+makes it safe to run daily regardless of the CA's actual certificate
+lifetime.
 
 ## 5. Publish workflow (the only write path)
 
@@ -229,16 +259,13 @@ by itself open a write path.
   by design. Migrating to the internal CA (`mavenrepo_tls_mode: acme`) now
   just needs `acme_directory_url` pointed at the CA's real ACME endpoint (and
   `acme_eab_kid`/vaulted `acme_eab_hmac_key` if it requires external account
-  binding) — no code or contract-confirmation work first. The original design
-  here assumed a bespoke REST API for the CA and needed its actual
-  request/response shape confirmed before `deploy/nginx/renew-cert.sh` could
-  be finished; that's been replaced with `cmd/acmeclient`, a minimal
-  stdlib-only ACME (RFC 8555) client using the HTTP-01 challenge — ACME is a
-  fixed protocol rather than a per-CA contract, so it works against any
-  conformant CA (step-ca, Vault PKI's ACME support, etc.) unmodified. Still
-  open: confirming the internal CA actually speaks ACME and has an EAB
-  requirement, if any. See [`acme-protocol.md`](acme-protocol.md) for the
-  protocol itself (message format, resources, full issuance sequence).
+  binding) — see §4.5 for what `cmd/acmeclient` (the client that handles
+  this) actually does, and [`acme-protocol.md`](acme-protocol.md) for the
+  protocol itself. No code or contract-confirmation work is needed first,
+  unlike the original design's bespoke REST API assumption — ACME is a fixed
+  protocol, so this works against any conformant CA (step-ca, Vault PKI's
+  ACME support, etc.) unmodified. Still open: confirming the internal CA
+  actually speaks ACME and has an EAB requirement, if any.
 - **Snapshot support is present but unused here**: the metadata regeneration
   logic handles `-SNAPSHOT` versions (timestamped and literal), but this
   deployment's use case (vetted, versioned third-party releases) doesn't
@@ -248,9 +275,12 @@ by itself open a write path.
 - **No automated test coverage for the Ansible layer**: `go test ./...`
   covers `main.go` (11 tests: auth, read-only rejection, metadata
   regeneration incl. the direct-placement `-regen` path, checksum
-  consistency, path-traversal safety, version comparison). The playbooks
-  have been syntax/template-validated but not run against a live host as
-  part of any CI.
+  consistency, path-traversal safety, version comparison) and
+  `cmd/acmeclient` (JWS/JWK correctness, an end-to-end issuance against a
+  mock ACME server with real signature verification, and the expiry/notify/
+  `-force` renewal logic from §4.5). The playbooks themselves have been
+  syntax/template-validated but not run against a live host as part of any
+  CI.
 - **Single-host by default**, but an opt-in two-backend HA topology now
   exists: an nginx `stream{}` TCP-passthrough load balancer in front of two
   independent backends, each running the same single-host stack (own TLS
