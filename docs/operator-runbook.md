@@ -146,27 +146,42 @@ ansible-playbook playbook.yml
 (The `creates:` idempotency guard only skips generation if the file's
 already there — deleting it first makes the playbook regenerate it.)
 
-### Switching to the internal CA
+### Switching to the internal CA (via ACME)
 
-Not yet available — `deploy/nginx/renew-cert.sh` has unresolved `TODO`s for
-the CA's actual API contract (endpoint, auth, request/response shape). Once
-those are filled in:
+Certs come from the internal CA over ACME (RFC 8555), via `cmd/acmeclient` —
+a minimal stdlib-only client using the HTTP-01 challenge. Unlike the earlier
+design (a bespoke REST API that needed its contract confirmed before
+`deploy/nginx/renew-cert.sh` could be finished), ACME is a fixed protocol, so
+no code changes are needed here — just the CA's actual endpoint:
 
-1. Set up the vault (see §7).
-2. Set `mavenrepo_tls_mode: internal_ca` in
-   `group_vars/mavenrepo_servers/vars.yml`.
-3. Remove the existing self-signed cert directory (as above) so the new mode
+1. Find the CA's ACME directory URL, and whether it requires external
+   account binding (EAB — common for private CAs like step-ca; get a key ID
+   + HMAC key from the CA if so).
+2. Set `acme_directory_url` (and `acme_eab_kid`, if needed) in
+   `group_vars/mavenrepo_servers/vars.yml`, and set
+   `mavenrepo_tls_mode: acme`.
+3. Set up the vault (see §7) — needed if EAB is required, to hold
+   `acme_eab_hmac_key`.
+4. Remove the existing self-signed cert directory (as above) so the new mode
    isn't blocked by the old cert's `creates:` guard.
-4. Re-run `ansible-playbook playbook.yml --ask-vault-pass`.
+5. Optionally set `acme_renew_before_days`/`acme_notify_before_days` (defaults
+   14/21 — days before expiry) and `acme_notify_cmd` (a shell command; see
+   `deploy/nginx/notify-cert-renewal.sh.example` for a Slack-webhook
+   starting point) in `vars.yml` if you want a heads-up before renewal and a
+   success/failure notification after.
+6. Re-run `ansible-playbook playbook.yml --ask-vault-pass`.
 
-Renewal after that point is automatic — `cert-renew.timer` runs
-`renew-cert.sh` daily on the host.
+Renewal after that point is automatic — `cert-renew.timer` runs `acmeclient`
+daily on the host, but it checks the installed certificate's actual expiry
+first and only contacts the CA once `acme_renew_before_days` are left, so
+this is unaffected by whether the CA issues short- or month-scale
+certificates. See [`acme-protocol.md`](acme-protocol.md) §9 for the details.
 
 ## 7. Setting up the vault (only needed if you change a default)
 
 Not required for the committed defaults. Needed if you set
-`mavenrepo_read_only: false` (write credentials) or
-`mavenrepo_tls_mode: internal_ca` (CA API token):
+`mavenrepo_read_only: false` (write credentials) or `mavenrepo_tls_mode: acme`
+with `acme_eab_kid` set (the EAB HMAC key that pairs with it):
 
 ```bash
 cp group_vars/mavenrepo_servers/vault.yml.example group_vars/mavenrepo_servers/vault.yml
@@ -186,6 +201,8 @@ ansible-playbook playbook.yml --ask-vault-pass
 | Newly published artifact 404s | `-regen` may not have run, or ran against the wrong path — re-check the `mvn_group_id`/`mvn_artifact_id`/`mvn_version` passed to `publish-artifact.yml` against the actual directory under `mavenrepo_data_dir` |
 | `<latest>`/`<release>` not reflecting a new version | Same as above — metadata only updates when `-regen` runs; direct file placement without it leaves metadata stale |
 | nginx config test fails after a manual edit | `nginx -t` on the host for the specific error; manual edits to `/etc/nginx/conf.d/mavenrepo.conf` will be overwritten by the next `ansible-playbook playbook.yml` run regardless — fix it in `templates/mavenrepo.conf.j2` instead |
+| No renewal notification received | `journalctl -u cert-renew -e` for the actual `acmeclient` run — a failing `acme_notify_cmd` is logged but doesn't fail the unit (a broken hook shouldn't hide whether the cert itself renewed); check the hook script/webhook independently |
+| Cert not renewing as expiry approaches | `journalctl -u cert-renew -e`; confirm `acme_renew_before_days` isn't set lower than expected, and that `cert-renew.timer` is actually enabled (`systemctl status cert-renew.timer`) |
 
 Useful commands on the host:
 

@@ -226,10 +226,19 @@ by itself open a write path.
   read (`http.Dir`) and write (`safePath`) paths.
 - **TLS**: currently self-signed (`mavenrepo_tls_mode: self_signed`,
   `deploy/nginx/gen-self-signed-cert.sh`), which is untrusted by any client
-  by design. Migrating to the internal CA's REST API
-  (`mavenrepo_tls_mode: internal_ca`) requires filling in the `TODO`s in
-  `deploy/nginx/renew-cert.sh` (endpoint, auth, request/response shape) once
-  that contract is confirmed — tracked, not yet done.
+  by design. Migrating to the internal CA (`mavenrepo_tls_mode: acme`) now
+  just needs `acme_directory_url` pointed at the CA's real ACME endpoint (and
+  `acme_eab_kid`/vaulted `acme_eab_hmac_key` if it requires external account
+  binding) — no code or contract-confirmation work first. The original design
+  here assumed a bespoke REST API for the CA and needed its actual
+  request/response shape confirmed before `deploy/nginx/renew-cert.sh` could
+  be finished; that's been replaced with `cmd/acmeclient`, a minimal
+  stdlib-only ACME (RFC 8555) client using the HTTP-01 challenge — ACME is a
+  fixed protocol rather than a per-CA contract, so it works against any
+  conformant CA (step-ca, Vault PKI's ACME support, etc.) unmodified. Still
+  open: confirming the internal CA actually speaks ACME and has an EAB
+  requirement, if any. See [`acme-protocol.md`](acme-protocol.md) for the
+  protocol itself (message format, resources, full issuance sequence).
 - **Snapshot support is present but unused here**: the metadata regeneration
   logic handles `-SNAPSHOT` versions (timestamped and literal), but this
   deployment's use case (vetted, versioned third-party releases) doesn't
@@ -258,10 +267,12 @@ by itself open a write path.
 | Path | What |
 |---|---|
 | `main.go`, `main_test.go` | The server |
+| `cmd/acmeclient/` | Minimal stdlib-only ACME (RFC 8555) client that provisions the nginx front's TLS cert from the internal CA |
 | `README.md` | User-facing usage, flags, build/run instructions |
 | `docs/maven-repo-runbook.md` | Broader comparison vs. Jetty/Nexus — background for scope decisions |
 | `docs/architecture.md` | This document |
 | `docs/operator-runbook.md` | Task-oriented setup/ops guide for this deployment |
+| `docs/acme-protocol.md` | Protocol-level reference for ACME (RFC 8555) itself |
 | `Dockerfile` | Containerized build (alternative to the systemd deployment described here) |
 | `deploy/nginx/` | Manual/single-host nginx + TLS reference and scripts |
 | `deploy/ansible/` | Fleet deployment + artifact-publish automation |

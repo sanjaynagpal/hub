@@ -194,4 +194,9 @@ very large ones). For those capabilities use a full repository manager — see
 embedded/standalone **Jetty** alternatives and when to reach for **Sonatype Nexus
 Repository**. Put TLS in front before exposing it — Basic auth over plaintext is
 not enough. [`deploy/nginx/`](deploy/nginx/) has a ready-made nginx reverse-proxy
-+ TLS config (internal-CA REST API renewal instead of ACME/Let's Encrypt).
++ TLS config, renewed from the internal CA over ACME (RFC 8555) via
+[`cmd/acmeclient`](cmd/acmeclient/) — a minimal stdlib-only client, in keeping
+with the rest of this repo, rather than a Python/certbot dependency. It checks
+the installed certificate's actual expiry (works with CAs issuing anything
+from day- to month-scale certificates), only renews once close to expiry, and
+can notify a hook of your choosing ahead of and after each renewal.

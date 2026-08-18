@@ -1,8 +1,32 @@
 [Unit]
-Description=Renew mavenrepo TLS certificate from internal CA
+Description=Renew mavenrepo TLS certificate from the internal CA over ACME
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/renew-cert.sh
+Environment=DOMAIN=maven.internal.example.com
+Environment=ACME_DIRECTORY_URL=https://ca.internal.example.com/acme/directory
+# acmeclient checks the installed cert's actual expiry every run and only
+# contacts the CA once ACME_RENEW_BEFORE_DAYS are left -- safe to run this
+# unit daily regardless of how long the CA's certificates are actually
+# valid for. ACME_NOTIFY_BEFORE_DAYS must be >= ACME_RENEW_BEFORE_DAYS.
+Environment=ACME_RENEW_BEFORE_DAYS=14
+Environment=ACME_NOTIFY_BEFORE_DAYS=21
+# To instead renew unconditionally on every run (the tool's original
+# behavior, before it started checking actual cert expiry) -- e.g. if you'd
+# rather lean on the CA's own rate limits than have acmeclient decide when
+# to renew -- set this and ignore ACME_RENEW_BEFORE_DAYS/ACME_NOTIFY_BEFORE_DAYS:
+# Environment=ACME_FORCE_RENEW=true
+# If the CA requires external account binding, also set:
+# Environment=ACME_EAB_KID=...
+# Environment=ACME_EAB_HMAC_KEY_FILE=/etc/nginx/certs/acme-eab-key
+# To get notified on renewal_upcoming/renewal_succeeded/renewal_failed
+# (NOTIFY_EVENT/NOTIFY_DOMAIN/NOTIFY_MESSAGE/NOTIFY_DAYS_REMAINING/
+# NOTIFY_EXPIRES_AT are set for the command to use). Point this at a small
+# wrapper script rather than an inline command -- anything with quotes/JSON
+# (a Slack webhook payload, say) is fragile to embed directly in a systemd
+# Environment= value, which has its own escaping rules on top of the shell's.
+# See notify-cert-renewal.sh.example for a copy-paste starting point.
+# Environment=NOTIFY_CMD=/usr/local/bin/notify-cert-renewal.sh
+ExecStart=/usr/local/bin/acmeclient

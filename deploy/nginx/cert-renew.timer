@@ -1,5 +1,9 @@
 [Unit]
 Description=Daily renewal check for the mavenrepo TLS certificate
+# acmeclient checks the installed certificate's actual expiry on every run
+# and only contacts the CA when within -renew-before-days -- most days this
+# is a cheap local no-op, so daily is fine even for a CA that issues
+# month-scale certificates. See docs/acme-protocol.md.
 
 [Timer]
 OnCalendar=daily

@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Generates a self-signed cert for local/testing use, dropped in the same
-# location and filenames renew-cert.sh would use -- so mavenrepo.conf works
-# unmodified whether the cert came from the internal CA or from here.
+# location and filenames acmeclient would use -- so mavenrepo.conf works
+# unmodified whether the cert came from the internal CA (via ACME) or from
+# here.
 #
 # NOT for production: nothing trusts this cert. Clients will need -k/--insecure
 # (curl), <server><configuration><httpConfiguration><param>...</param> insecure

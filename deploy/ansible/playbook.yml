@@ -23,7 +23,7 @@
           first (https://go.dev/dl/) and re-run.
       when: go_check.rc != 0
 
-    - name: go build linux/amd64
+    - name: go build linux/amd64 (mavenrepo)
       ansible.builtin.command:
         cmd: go build -trimpath -ldflags="-s -w" -o {{ playbook_dir }}/files/mavenrepo-linux-amd64 .
         chdir: "{{ playbook_dir }}/../.."
@@ -32,6 +32,17 @@
         GOARCH: amd64
         CGO_ENABLED: "0"
       changed_when: true
+
+    - name: go build linux/amd64 (acmeclient)
+      ansible.builtin.command:
+        cmd: go build -trimpath -ldflags="-s -w" -o {{ playbook_dir }}/files/acmeclient-linux-amd64 ./cmd/acmeclient
+        chdir: "{{ playbook_dir }}/../.."
+      environment:
+        GOOS: linux
+        GOARCH: amd64
+        CGO_ENABLED: "0"
+      changed_when: true
+      when: mavenrepo_tls_mode == 'acme'
 
 - name: Deploy mavenrepo behind an nginx TLS front
   hosts: mavenrepo_servers
@@ -137,7 +148,7 @@
         mode: "0644"
       notify: reload nginx
 
-    # ---- TLS: self-signed (default until the internal CA API is confirmed) ----
+    # ---- TLS: self-signed (default until the internal CA's ACME endpoint is confirmed) ----
     - name: Generate a self-signed cert
       ansible.builtin.script:
         cmd: "{{ playbook_dir }}/../nginx/gen-self-signed-cert.sh {{ mavenrepo_domain }} {{ mavenrepo_self_signed_days }}"
@@ -145,46 +156,60 @@
       when: mavenrepo_tls_mode == 'self_signed'
       notify: reload nginx
 
-    # ---- TLS: internal CA (flip mavenrepo_tls_mode once the API is confirmed) ----
-    - name: Install the CA API auth token
+    # ---- TLS: ACME (RFC 8555) against the internal CA ----
+    # Unlike a bespoke REST contract, ACME needs no CA-specific integration
+    # work to confirm -- acmeclient (cmd/acmeclient) speaks the spec directly.
+    # EAB (external account binding) is only required by some private CAs.
+    - name: Create the ACME HTTP-01 webroot
+      ansible.builtin.file:
+        path: /var/www/acme-challenge
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      when: mavenrepo_tls_mode == 'acme'
+
+    - name: Install the EAB HMAC key, if the CA requires external account binding
       ansible.builtin.copy:
-        content: "{{ ca_api_token }}"
-        dest: /etc/nginx/certs/ca-api-token
+        content: "{{ acme_eab_hmac_key }}"
+        dest: /etc/nginx/certs/acme-eab-key
         owner: root
         group: root
         mode: "0600"
-      when: mavenrepo_tls_mode == 'internal_ca'
+      when: mavenrepo_tls_mode == 'acme' and acme_eab_kid | length > 0
       no_log: true
 
-    - name: Install renew-cert.sh
+    - name: Install the acmeclient binary
       ansible.builtin.copy:
-        src: "{{ playbook_dir }}/../nginx/renew-cert.sh"
-        dest: /usr/local/bin/renew-cert.sh
+        src: acmeclient-linux-amd64
+        dest: /usr/local/bin/acmeclient
         mode: "0750"
-      when: mavenrepo_tls_mode == 'internal_ca'
+      when: mavenrepo_tls_mode == 'acme'
 
-    - name: Install the cert-renew systemd unit (per-host domain/endpoint)
+    - name: Install the cert-renew systemd unit (per-host domain/directory URL)
       ansible.builtin.template:
         src: cert-renew.service.j2
         dest: /etc/systemd/system/cert-renew.service
         mode: "0644"
-      when: mavenrepo_tls_mode == 'internal_ca'
+      when: mavenrepo_tls_mode == 'acme'
 
     - name: Install the cert-renew timer
       ansible.builtin.copy:
         src: "{{ playbook_dir }}/../nginx/cert-renew.timer"
         dest: /etc/systemd/system/cert-renew.timer
         mode: "0644"
-      when: mavenrepo_tls_mode == 'internal_ca'
+      when: mavenrepo_tls_mode == 'acme'
 
-    - name: Seed the initial CA-issued cert
-      ansible.builtin.command: /usr/local/bin/renew-cert.sh
+    - name: Seed the initial ACME-issued cert
+      ansible.builtin.command: /usr/local/bin/acmeclient
       args:
         creates: "/etc/nginx/certs/{{ mavenrepo_domain }}/fullchain.pem"
       environment:
         DOMAIN: "{{ mavenrepo_domain }}"
-        CA_ENDPOINT: "{{ ca_endpoint }}"
-      when: mavenrepo_tls_mode == 'internal_ca'
+        ACME_DIRECTORY_URL: "{{ acme_directory_url }}"
+        ACME_EAB_KID: "{{ acme_eab_kid }}"
+        ACME_EAB_HMAC_KEY_FILE: "{{ '/etc/nginx/certs/acme-eab-key' if acme_eab_kid | length > 0 else '' }}"
+      when: mavenrepo_tls_mode == 'acme'
       notify: reload nginx
 
     - name: Enable the cert-renew timer
@@ -193,7 +218,7 @@
         state: started
         enabled: true
         daemon_reload: true
-      when: mavenrepo_tls_mode == 'internal_ca'
+      when: mavenrepo_tls_mode == 'acme'
 
     - name: Enable and start nginx
       ansible.builtin.systemd:

@@ -6,18 +6,38 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `hub` (module `github.com/sanjaynagpal/hub`) is a single-file Maven repository
 server written in Go, standard library only — no third-party dependencies.
-Everything lives in `main.go` (~540 lines) plus `main_test.go`. There is no
-`internal/`, `pkg/`, or multi-package structure to navigate; read `main.go`
-directly.
+Everything the server needs lives in `main.go` (~540 lines) plus
+`main_test.go`; read `main.go` directly rather than hunting through an
+`internal/`/`pkg/` layout, since there isn't one.
+
+The one other Go package in this repo is `cmd/acmeclient/` — a small,
+independent, stdlib-only ACME (RFC 8555) client that provisions the TLS
+certificate for the nginx front described below (`main.go` itself has no TLS
+of its own; it's meant to sit behind a reverse proxy). It doesn't import or
+get imported by the server; treat it as its own single-file tool with its
+own `main_test.go`. It's expiry-aware by default, not a blind
+reissue-every-run tool: `run()` reads the installed certificate's actual
+`NotAfter` and only renews within `-renew-before-days`, firing an optional
+`-notify-cmd` hook both as a heads-up (`-notify-before-days` out) and after
+each renewal attempt succeeds or fails. `-force` opts back into unconditional
+renewal on every run, for operators who'd rather lean on the CA's own rate
+limits — see `docs/acme-protocol.md` §9 for the reasoning.
 
 ## Commands
 
 ```bash
 go build -o mavenrepo .        # build
 go run . -addr :8080 -root ./repo   # run locally
-go test ./...                  # run all tests
+go test ./...                  # run all tests (both packages)
 go test -run TestSnapshotMetadataRegeneration ./...   # run a single test
 go vet ./...
+```
+
+Building `cmd/acmeclient` (only needed when working on TLS provisioning, not
+the server itself):
+
+```bash
+go build -o acmeclient ./cmd/acmeclient
 ```
 
 Cross-compiling (no target-host toolchain needed):
@@ -25,6 +45,7 @@ Cross-compiling (no target-host toolchain needed):
 ```bash
 GOOS=linux GOARCH=amd64 go build -o mavenrepo-linux-amd64 .
 GOOS=linux GOARCH=arm64 go build -o mavenrepo-linux-arm64 .
+GOOS=linux GOARCH=amd64 go build -o acmeclient-linux-amd64 ./cmd/acmeclient
 ```
 
 Docker (multi-stage, static binary into `FROM scratch`, non-root uid 65532):
@@ -98,13 +119,18 @@ checksum consistency, so run `go test ./...` after any change here.
 - `docs/architecture.md` — architecture doc for the `mvn-dev-repo.slab.com`
   deployment specifically: component breakdown, the `-read-only` +
   operator-publish design decision and why `mvn deploy` credentials were
-  rejected for this host, and open items (pending internal-CA integration,
-  etc).
+  rejected for this host, and open items (confirming the internal CA's ACME
+  directory URL/EAB requirement, etc).
 - `docs/operator-runbook.md` — task-oriented ops guide for that same
   deployment: first-time setup, publishing/removing an artifact via
   `deploy/ansible/publish-artifact.yml`, cert renewal, troubleshooting.
+- `docs/acme-protocol.md` — protocol-level reference for ACME (RFC 8555)
+  itself: message format, resources/state machines, challenge types, the
+  full issuance sequence — independent of this repo, with pointers into
+  `cmd/acmeclient/main.go` for where each piece is implemented.
 
-None of these three are something the code depends on, but `architecture.md`
+None of these four are something the code depends on, but `architecture.md`
 and `operator-runbook.md` describe `-read-only`/`-regen` (main.go flags) and
-the Ansible layout under `deploy/`, so re-check them for accuracy if either
-changes.
+the Ansible layout under `deploy/`, and `acme-protocol.md` describes
+`cmd/acmeclient`'s behavior, so re-check the relevant doc for accuracy if any
+of those change.

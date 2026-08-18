@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Example acmeclient -notify-cmd / NOTIFY_CMD target: posts a Slack incoming
+# webhook message for each renewal_upcoming/renewal_succeeded/renewal_failed
+# event. Copy to /usr/local/bin/notify-cert-renewal.sh, fill in the webhook
+# URL (or better, read it from a root-owned file instead of hardcoding it
+# here -- see the comment below), chmod +x, and point NOTIFY_CMD at it
+# (see cert-renew.service).
+#
+# acmeclient sets these environment variables before running this script:
+#   NOTIFY_EVENT           renewal_upcoming | renewal_succeeded | renewal_failed
+#   NOTIFY_DOMAIN          the domain the certificate is for
+#   NOTIFY_MESSAGE         a human-readable summary, ready to post as-is
+#   NOTIFY_DAYS_REMAINING  days left on the certificate (0 for renewal_failed)
+#   NOTIFY_EXPIRES_AT      RFC3339 expiry timestamp (unset for renewal_failed)
+set -euo pipefail
+
+# Prefer reading the webhook URL from a root-owned, mode-0600 file over
+# hardcoding it here -- this script itself may end up world-readable.
+WEBHOOK_URL="$(cat /etc/nginx/certs/slack-webhook-url)"
+
+case "$NOTIFY_EVENT" in
+  renewal_upcoming)  emoji=":hourglass_flowing_sand:" ;;
+  renewal_succeeded) emoji=":white_check_mark:" ;;
+  renewal_failed)    emoji=":rotating_light:" ;;
+  *)                 emoji=":information_source:" ;;
+esac
+
+# NOTIFY_MESSAGE is acmeclient's own generated text (domain + RFC3339
+# timestamp + day counts) and never contains a literal quote today, so this
+# unescaped substitution is fine as-is -- but if you change the message
+# format, or want to be defensive, escape embedded `"` and `\` first.
+payload=$(printf '{"text": "%s %s"}' "$emoji" "$NOTIFY_MESSAGE")
+
+curl -sf -X POST -H "Content-Type: application/json" -d "$payload" "$WEBHOOK_URL"

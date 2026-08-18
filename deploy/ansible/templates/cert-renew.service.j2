@@ -1,10 +1,22 @@
 [Unit]
-Description=Renew mavenrepo TLS certificate from internal CA
+Description=Renew mavenrepo TLS certificate from the internal CA over ACME
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 Environment=DOMAIN={{ mavenrepo_domain }}
-Environment=CA_ENDPOINT={{ ca_endpoint }}
-ExecStart=/usr/local/bin/renew-cert.sh
+Environment=ACME_DIRECTORY_URL={{ acme_directory_url }}
+Environment=ACME_RENEW_BEFORE_DAYS={{ acme_renew_before_days }}
+Environment=ACME_NOTIFY_BEFORE_DAYS={{ acme_notify_before_days }}
+{% if acme_force_renew %}
+Environment=ACME_FORCE_RENEW=true
+{% endif %}
+{% if acme_eab_kid | length > 0 %}
+Environment=ACME_EAB_KID={{ acme_eab_kid }}
+Environment=ACME_EAB_HMAC_KEY_FILE=/etc/nginx/certs/acme-eab-key
+{% endif %}
+{% if acme_notify_cmd | length > 0 %}
+Environment=NOTIFY_CMD={{ acme_notify_cmd }}
+{% endif %}
+ExecStart=/usr/local/bin/acmeclient

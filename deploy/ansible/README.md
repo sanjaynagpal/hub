@@ -29,11 +29,16 @@ hand-installed box.
    `-pass-file` points at a root-owned, mode-0600 file instead; the playbook
    writes the vaulted password there rather than putting it on the command
    line. `-pass` still works for quick manual runs.
-2. **`deploy/nginx/renew-cert.sh` now reads `DOMAIN`/`CA_ENDPOINT`/
-   `AUTH_TOKEN_FILE` from the environment** (falling back to the same
-   defaults as before) instead of having them hardcoded. That lets the exact
-   same script file be copied to every host unmodified — per-host values come
-   from the templated systemd unit's `Environment=` lines.
+2. **`cmd/acmeclient` (a minimal stdlib-only RFC 8555 ACME client) replaced
+   the earlier `deploy/nginx/renew-cert.sh`.** That script assumed a bespoke
+   REST contract for the internal CA (endpoint, auth, request/response
+   shape) that was never confirmed — full of `TODO`s as a result. ACME is a
+   fixed protocol instead of a per-CA contract to reverse-engineer, so
+   `acmeclient` works against any conformant CA (step-ca, Vault PKI's ACME
+   support, etc.) with no such confirmation needed. It reads
+   `DOMAIN`/`ACME_DIRECTORY_URL`/etc. from the environment, so the same
+   binary is copied to every host unmodified — per-host values come from the
+   templated systemd unit's `Environment=` lines, same pattern as before.
 3. **A systemd unit for `mavenrepo` itself didn't exist yet** (only the nginx
    cert-renewal timer did) — added as `templates/mavenrepo.service.j2`, run
    under a dedicated non-root `mavenrepo` system user with `ProtectSystem=strict`.
@@ -65,12 +70,24 @@ hand-installed box.
 Set in `group_vars/mavenrepo_servers/vars.yml` (non-secret, committed):
 
 - `mavenrepo_domain` — `mvn-dev-repo.slab.com`
-- `mavenrepo_tls_mode` — `self_signed` (default, for now) or `internal_ca`.
-  Flip this once the CA's actual REST API contract is filled in in
-  `../nginx/renew-cert.sh` (still has `TODO`s).
+- `mavenrepo_tls_mode` — `self_signed` (default, for now) or `acme`. Flip
+  this once `acme_directory_url` points at the real internal CA — no code
+  changes needed, since ACME is a fixed protocol rather than a contract this
+  repo has to guess at.
 - `mavenrepo_bind_port`, `mavenrepo_install_dir`, `mavenrepo_data_dir`,
   `mavenrepo_system_user`/`_group`, `mavenrepo_read_auth`,
-  `mavenrepo_self_signed_days`, `ca_endpoint`
+  `mavenrepo_self_signed_days`, `acme_directory_url`, `acme_eab_kid`
+- `acme_renew_before_days` / `acme_notify_before_days` — how close to the
+  certificate's *actual* expiry (not an assumed lifetime — acmeclient checks
+  the installed cert directly) to renew, and how far ahead of that to send a
+  one-time heads-up via `acme_notify_cmd`. Defaults `14`/`21`.
+- `acme_notify_cmd` — shell command run on renewal_upcoming/renewal_succeeded/renewal_failed
+  (empty by default — no notifications sent). See the comment in `vars.yml`
+  for the environment variables it receives.
+- `acme_force_renew` — `false` by default. Set `true` to skip the expiry
+  check entirely and renew on every timer run instead, the tool's original
+  behavior — for operators who'd rather lean on the CA's own rate limits (or
+  lack thereof) than have `acmeclient` decide when to renew.
 - `mavenrepo_read_only` — `true` by default (matches this repo's actual usage:
   operator-published artifacts only, no `mvn deploy`). Set `false` for a host
   that should accept normal authenticated `mvn deploy` uploads over HTTP.
@@ -81,7 +98,9 @@ Secrets (vaulted, **not** committed):
   writes. **Only needed if `mavenrepo_read_only: false`** — a fully
   read-only host never provisions write credentials, since there's no HTTP
   write path for them to guard.
-- `ca_api_token` — only read when `mavenrepo_tls_mode: internal_ca`
+- `acme_eab_hmac_key` — only read when `mavenrepo_tls_mode: acme` and
+  `acme_eab_kid` (vars.yml) is set, i.e. only if the internal CA requires
+  external account binding.
 
 ## First run
 
@@ -199,7 +218,7 @@ firewall manager, deliberately left out of this playbook).
   `creates:` so an existing cert is left alone (self-signed certs aren't
   re-issued on every run, and the CA-issued one is only re-fetched by the
   `cert-renew.timer`, not by re-running this playbook).
-- Switching `mavenrepo_tls_mode` from `self_signed` to `internal_ca` later
+- Switching `mavenrepo_tls_mode` from `self_signed` to `acme` later
   will not by itself replace an already-issued self-signed cert on disk
   (same `creates:` guard) — delete
   `/etc/nginx/certs/{{ mavenrepo_domain }}/fullchain.pem` on the host first,

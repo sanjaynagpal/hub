@@ -15,6 +15,14 @@ server {
     # Don't hand an attacker the exact nginx version for free.
     server_tokens off;
 
+    # ACME HTTP-01 challenges (cmd/acmeclient) must be served in plaintext,
+    # so this is exempted from the HTTPS redirect below. Harmless to keep
+    # even under self-signed mode -- nginx just 404s here if unused.
+    location /.well-known/acme-challenge/ {
+        root /var/www/acme-challenge;
+        try_files $uri =404;
+    }
+
     location / {
         return 301 https://$host$request_uri;
     }

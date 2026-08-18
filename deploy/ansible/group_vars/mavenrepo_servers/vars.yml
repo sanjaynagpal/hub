@@ -21,10 +21,45 @@ mavenrepo_read_auth: false
 mavenrepo_read_only: true
 
 # self_signed: fine for a dev repo, nothing external trusts it, matches how
-#   this was validated locally before the CA integration existed.
-# internal_ca: switch to this once the CA API's real request/response shape
-#   is filled in in deploy/nginx/renew-cert.sh (currently has TODOs).
+#   this was validated locally before ACME issuance existed.
+# acme: obtains/renews the cert from the internal CA over ACME (RFC 8555),
+#   via cmd/acmeclient -- see deploy/nginx/README.md. No CA-specific contract
+#   to confirm first (unlike the earlier REST-API design this replaced):
+#   ACME is a fixed spec, so this works against any conformant CA.
 mavenrepo_tls_mode: self_signed
 mavenrepo_self_signed_days: 825
 
-ca_endpoint: "https://ca.internal.example.com/api/v1/sign-csr"
+acme_directory_url: "https://ca.internal.example.com/acme/directory"
+
+# Only needed if the internal CA requires external account binding (EAB) --
+# common for private CAs (step-ca, Vault PKI's ACME support), rare for public
+# ones. Leave blank to skip EAB. The key ID isn't secret; the HMAC key that
+# pairs with it (acme_eab_hmac_key) is, so that one lives in vault.yml.
+acme_eab_kid: ""
+
+# acmeclient checks the installed certificate's real expiry on every run
+# (cheap, no CA contact needed) rather than assuming a lifetime, so these
+# work whether the CA issues short- or month-scale certificates:
+#   - acme_renew_before_days: actually renew once this many days are left.
+#   - acme_notify_before_days: fire acme_notify_cmd once, as a heads-up,
+#     this many days out -- must be >= acme_renew_before_days.
+acme_renew_before_days: 14
+acme_notify_before_days: 21
+
+# Bypasses the expiry check above entirely and renews on every timer run --
+# the tool's original behavior, before it started watching the installed
+# certificate's actual expiry. An option for operators who'd rather rely on
+# the CA's own rate limiting (or lack of one) than have acmeclient decide
+# when to renew, or who just want maximum key rotation frequency. Leave
+# false to get the expiry-aware default.
+acme_force_renew: false
+
+# Shell command run on renewal_upcoming/renewal_succeeded/renewal_failed,
+# with NOTIFY_EVENT/NOTIFY_DOMAIN/NOTIFY_MESSAGE/NOTIFY_DAYS_REMAINING/
+# NOTIFY_EXPIRES_AT set -- e.g. a curl to a Slack webhook, `mail`, `logger`.
+# Left empty by default (no notifications sent). If the command needs a
+# secret (a webhook URL, an API token), don't embed it here -- have the
+# command source it from a root-owned file instead, the same way
+# mavenrepo's write password uses -pass-file rather than -pass on the
+# command line.
+acme_notify_cmd: ""

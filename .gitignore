@@ -1,6 +1,8 @@
 # Build output
 /mavenrepo
 /mavenrepo-*
+/acmeclient
+/acmeclient-*
 *.exe
 
 # Local repository data / test dirs created at runtime
@@ -8,10 +10,11 @@
 /testrepo/
 /data/
 
-# Ansible: never commit a decrypted vault, or the cross-compiled binary
-# the playbook builds locally before copying it to target hosts.
+# Ansible: never commit a decrypted vault, or the cross-compiled binaries
+# the playbook builds locally before copying them to target hosts.
 /deploy/ansible/group_vars/**/vault.yml
 /deploy/ansible/files/mavenrepo-linux-*
+/deploy/ansible/files/acmeclient-linux-*
 
 # OS / editor cruft
 .DS_Store

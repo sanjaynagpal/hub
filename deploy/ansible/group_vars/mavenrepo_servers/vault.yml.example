@@ -17,5 +17,8 @@
 mavenrepo_deploy_user: deployer
 mavenrepo_deploy_password: CHANGE_ME
 
-# Only read when mavenrepo_tls_mode is internal_ca (see vars.yml).
-ca_api_token: CHANGE_ME
+# Only read when mavenrepo_tls_mode is 'acme' and acme_eab_kid (vars.yml) is
+# set -- i.e. only if the internal CA requires external account binding.
+# Must be the base64url-encoded form of the HMAC key the CA issued alongside
+# acme_eab_kid.
+acme_eab_hmac_key: CHANGE_ME
