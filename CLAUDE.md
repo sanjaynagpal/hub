@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `hub` (module `github.com/sanjaynagpal/hub`) is a single-file Maven repository
 server written in Go, standard library only — no third-party dependencies.
-Everything the server needs lives in `main.go` (~540 lines) plus
+Everything the server needs lives in `main.go` (~620 lines) plus
 `main_test.go`; read `main.go` directly rather than hunting through an
 `internal/`/`pkg/` layout, since there isn't one.
 
