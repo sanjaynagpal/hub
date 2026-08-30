@@ -43,6 +43,47 @@ GOOS=linux  GOARCH=arm64 go build -o mavenrepo-linux-arm64 .
 | `-read-only` | `false`   | Reject PUT/DELETE outright (405) regardless of credentials — for repos populated out-of-band instead of via `mvn deploy` |
 | `-regen`     | *(empty)* | Regenerate `maven-metadata.xml` for the given version directory (relative to `-root`) and exit, without starting the server — for artifacts placed directly on disk |
 | `-max-upload-size` | `524288000` (500 MiB) | Maximum PUT request body size in bytes, enforced by the server itself regardless of any reverse-proxy limit (`0` = unlimited) |
+| `-allow-proxies` | `false` | Expose `GET /-/hub/events`, a change-notification stream for Hub Proxy instances (see below) |
+
+## Proxy mode
+
+`hub` can also run as a **Hub Proxy**: a read-through cache in front of another Hub instance (the *upstream*). A proxy serves artifacts from its own local cache when it has them, and otherwise fetches them from the upstream and caches them before replying. It never accepts writes — `PUT`/`DELETE` always return 405, regardless of credentials; `mvn deploy` always targets the upstream directly.
+
+```bash
+# On the upstream, allow proxies to attach:
+./mavenrepo -addr :8080 -root /opt/maven-repo -allow-proxies
+
+# On the proxy:
+./mavenrepo -addr :8080 -root ./proxy-cache -upstream http://upstream-host:8080
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-upstream` | *(empty)* | Upstream Hub base URL. Presence of this flag switches the binary into proxy mode |
+| `-upstream-user` / `-upstream-pass` / `-upstream-pass-file` | *(empty)* | Credentials for authenticating *to* the upstream — independent of this proxy's own `-user`/`-pass`/`-read-auth`, which still gate its own downstream clients |
+| `-sync-interval` | `60s` | Poll-fallback interval, active only while the push connection to the upstream is disconnected |
+| `-join-timeout` | `30s` | How long to wait for the initial connection to the upstream before giving up and exiting |
+
+A proxy must successfully **join** its upstream (connect to `GET /-/hub/events` on a Hub started with `-allow-proxies`) before it starts serving its own traffic — if the upstream is unreachable at startup, the proxy exits rather than serving from an empty, unsynchronized cache. Once running, staleness is bounded two ways: the upstream pushes a change notification the instant an artifact is written or deleted, so a proxy's cache is invalidated (and re-fetched fresh on the next request) almost immediately; and if that connection drops, the proxy falls back to periodically re-validating its cached `maven-metadata.xml` files every `-sync-interval` until the push connection reconnects. A later disconnect degrades to serving (possibly stale) cached content rather than failing requests — only the *initial* join is mandatory.
+
+`-upstream` cannot be combined with `-regen`, `-read-only` (proxy mode is always read-only), or `-allow-proxies` (proxy-of-proxy chaining isn't supported).
+
+## Mirror mode
+
+A **Hub Mirror** is a Hub Proxy that additionally keeps a *complete* copy of the upstream rather than only caching what's been requested. Add `-mirror` to a proxy invocation:
+
+```bash
+./mavenrepo -addr :8080 -root ./mirror-store -upstream http://upstream-host:8080 -mirror
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-mirror` | `false` | Requires `-upstream`. Eagerly pull and keep a complete copy of the upstream instead of only caching what's requested |
+| `-mirror-concurrency` | `8` | How many files to fetch in parallel during a full sync pass |
+
+A mirror serves traffic exactly like a proxy (same fetch-through-on-miss behavior, same read-only enforcement) but additionally runs a background sync: right after joining, it fetches the upstream's full file listing (`GET /-/hub/manifest`, also gated by `-allow-proxies`) and pulls anything it's missing; while the push connection is down, it periodically repeats that reconciliation — pulling newly-added upstream files and removing local files the upstream no longer has — rather than only re-validating what it already cached (a Hub Proxy's narrower poll fallback). This makes a mirror's disk a genuine, current replica of the upstream, not a request-shaped subset.
+
+**Disaster recovery**: because a mirror's copy is complete, it's a credible thing to promote to a standalone Hub if the real Hub's machine is lost — stop the mirror process, restart the *same binary* against the *same* `-root` without `-upstream` (add `-user`/`-pass` if that host should accept `mvn deploy` writes again). This is a manual, documented recovery procedure, not an automatic failover: there's no replication/consensus behind it, so if you run multiple mirrors, confirm which one has the most recent successful sync before promoting it.
 
 ## Docker
 

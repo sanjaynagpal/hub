@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bufio"
+	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"io"
 	"net/http"
@@ -11,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestServer sets repoRoot to a temp dir and returns a running test server
@@ -18,7 +22,7 @@ import (
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	repoRoot = t.TempDir()
-	srv := httptest.NewServer(newHandler("deployer", "s3cret", false, false))
+	srv := httptest.NewServer(newHandler("deployer", "s3cret", false, false, false))
 	t.Cleanup(srv.Close)
 	return srv
 }
@@ -109,7 +113,7 @@ func TestResolvePasswordFallsBackToFlag(t *testing.T) {
 
 func TestReadOnlyRejectsWrites(t *testing.T) {
 	repoRoot = t.TempDir()
-	srv := httptest.NewServer(newHandler("deployer", "s3cret", false, true))
+	srv := httptest.NewServer(newHandler("deployer", "s3cret", false, true, false))
 	t.Cleanup(srv.Close)
 
 	// Even with correct credentials, writes are rejected outright.
@@ -330,7 +334,7 @@ func TestUploadSizeLimit(t *testing.T) {
 	orig := maxUploadSize
 	maxUploadSize = 8 // bytes
 	t.Cleanup(func() { maxUploadSize = orig })
-	srv := httptest.NewServer(newHandler("deployer", "s3cret", false, false))
+	srv := httptest.NewServer(newHandler("deployer", "s3cret", false, false, false))
 	t.Cleanup(srv.Close)
 
 	req, err := http.NewRequest(http.MethodPut, srv.URL+"/"+snapDir+"/x.jar", strings.NewReader("this body is way over the limit"))
@@ -375,7 +379,7 @@ func TestDeleteErrorDoesNotLeakServerPath(t *testing.T) {
 func TestSafePathContainsTraversal(t *testing.T) {
 	repoRoot = t.TempDir()
 	for _, p := range []string{"/../../etc/passwd", "/a/../../b", "/../.."} {
-		full, ok := safePath(p)
+		full, ok := safePath(repoRoot, p)
 		if !ok {
 			continue // rejected outright is also fine
 		}
@@ -400,6 +404,264 @@ func TestCompareVersion(t *testing.T) {
 	for _, c := range cases {
 		if got := compareVersion(c.a, c.b); got != c.want {
 			t.Errorf("compareVersion(%q,%q)=%d, want %d", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// ---- proxy change notifications ---------------------------------------
+
+// newProxyableTestServer is like newTestServer but with -allow-proxies
+// enabled (an eventsBroadcaster wired in).
+func newProxyableTestServer(t *testing.T, user, pass string) *httptest.Server {
+	t.Helper()
+	repoRoot = t.TempDir()
+	eventsBroadcaster = newEventBroadcaster()
+	t.Cleanup(func() { eventsBroadcaster = nil })
+	srv := httptest.NewServer(newHandler(user, pass, false, false, true))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// subscribeEvents opens a streaming GET to /-/hub/events and returns a
+// channel of decoded events plus the response's status code.
+func subscribeEvents(t *testing.T, base, user, pass string) (status int, events <-chan hubEvent, cancel func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/-/hub/events", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if user != "" {
+		req.SetBasicAuth(user, pass)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		cancel()
+		t.Fatalf("GET /-/hub/events: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		defer resp.Body.Close()
+		return resp.StatusCode, nil, cancel
+	}
+	ch := make(chan hubEvent, 16)
+	go func() {
+		defer resp.Body.Close()
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			var ev hubEvent
+			if err := json.Unmarshal(scanner.Bytes(), &ev); err == nil {
+				ch <- ev
+			}
+		}
+	}()
+	return resp.StatusCode, ch, cancel
+}
+
+// waitForChanged reads events until a "changed" event for dir arrives, a
+// "changed" for a different dir shows up too many times, or timeout elapses.
+func waitForChanged(t *testing.T, events <-chan hubEvent, dir string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for {
+		select {
+		case ev := <-events:
+			if ev.Type == "changed" && ev.Dir == dir {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for changed event on %q", dir)
+		}
+	}
+}
+
+func TestEventsGatedByAllowProxies(t *testing.T) {
+	srv := newTestServer(t) // allowProxies=false
+	code, _, cancel := subscribeEvents(t, srv.URL, "", "")
+	defer cancel()
+	if code != http.StatusNotFound {
+		t.Fatalf("GET /-/hub/events with -allow-proxies off: got %d, want 404 (same as any other missing path)", code)
+	}
+}
+
+func TestEventsRequiresAuthWhenUserSet(t *testing.T) {
+	srv := newProxyableTestServer(t, "deployer", "s3cret")
+
+	code, _, cancel := subscribeEvents(t, srv.URL, "", "")
+	cancel()
+	if code != http.StatusUnauthorized {
+		t.Fatalf("GET /-/hub/events without credentials: got %d, want 401", code)
+	}
+
+	code, _, cancel = subscribeEvents(t, srv.URL, "deployer", "s3cret")
+	defer cancel()
+	if code != http.StatusOK {
+		t.Fatalf("GET /-/hub/events with credentials: got %d, want 200", code)
+	}
+}
+
+func TestEventsOpenWhenUserEmpty(t *testing.T) {
+	srv := newProxyableTestServer(t, "", "")
+	code, _, cancel := subscribeEvents(t, srv.URL, "", "")
+	defer cancel()
+	if code != http.StatusOK {
+		t.Fatalf("GET /-/hub/events with no -user configured: got %d, want 200", code)
+	}
+}
+
+func TestBroadcastOnArtifactPut(t *testing.T) {
+	srv := newProxyableTestServer(t, "deployer", "s3cret")
+	_, events, cancel := subscribeEvents(t, srv.URL, "deployer", "s3cret")
+	defer cancel()
+
+	mustPut(t, srv.URL, snapDir+"/x.jar", "data")
+	waitForChanged(t, events, snapDir, 5*time.Second)
+}
+
+func TestBroadcastOnDirectMetadataPut(t *testing.T) {
+	srv := newProxyableTestServer(t, "deployer", "s3cret")
+	mustPut(t, srv.URL, snapDir+"/x.jar", "data") // establish the version dir first
+
+	_, events, cancel := subscribeEvents(t, srv.URL, "deployer", "s3cret")
+	defer cancel()
+
+	mustPut(t, srv.URL, snapDir+"/maven-metadata.xml", "<metadata/>")
+	waitForChanged(t, events, snapDir, 5*time.Second)
+}
+
+func TestBroadcastOnDelete(t *testing.T) {
+	srv := newProxyableTestServer(t, "deployer", "s3cret")
+	mustPut(t, srv.URL, snapDir+"/x.jar", "data")
+
+	_, events, cancel := subscribeEvents(t, srv.URL, "deployer", "s3cret")
+	defer cancel()
+
+	req, err := http.NewRequest(http.MethodDelete, srv.URL+"/"+snapDir+"/x.jar", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.SetBasicAuth("deployer", "s3cret")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("DELETE: got %d, want 204", resp.StatusCode)
+	}
+	waitForChanged(t, events, snapDir, 5*time.Second)
+}
+
+// TestBroadcastDropsSlowSubscriber proves broadcast() never blocks a caller
+// on a subscriber that isn't draining its buffer -- it must drop (and close)
+// that subscriber instead.
+func TestBroadcastDropsSlowSubscriber(t *testing.T) {
+	b := newEventBroadcaster()
+	_, ch := b.subscribe()
+
+	for i := 0; i < eventBufferSize+1; i++ { // one more than the buffer holds
+		done := make(chan struct{})
+		go func() {
+			b.broadcast(hubEvent{Type: "changed", Dir: "x"})
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("broadcast #%d blocked on a full, undrained subscriber buffer", i)
+		}
+	}
+
+	closed := false
+	for i := 0; i < eventBufferSize+2; i++ {
+		if _, ok := <-ch; !ok {
+			closed = true
+			break
+		}
+	}
+	if !closed {
+		t.Fatal("dropped subscriber's channel was never closed")
+	}
+}
+
+// ---- manifest (GET /-/hub/manifest) ------------------------------------
+
+// fetchManifest issues GET /-/hub/manifest and returns the status code plus
+// the decoded relative paths (nil if the response wasn't NDJSON/200).
+func fetchManifest(t *testing.T, base, user, pass string) (int, []string) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, base+"/-/hub/manifest", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if user != "" {
+		req.SetBasicAuth(user, pass)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /-/hub/manifest: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return resp.StatusCode, nil
+	}
+	var paths []string
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		var e manifestEntry
+		if err := json.Unmarshal(scanner.Bytes(), &e); err == nil {
+			paths = append(paths, e.Path)
+		}
+	}
+	return resp.StatusCode, paths
+}
+
+func TestManifestGatedByAllowProxies(t *testing.T) {
+	srv := newTestServer(t) // allowProxies=false
+	code, _ := fetchManifest(t, srv.URL, "", "")
+	if code != http.StatusNotFound {
+		t.Fatalf("GET /-/hub/manifest with -allow-proxies off: got %d, want 404 (same as any other missing path)", code)
+	}
+}
+
+func TestManifestRequiresAuthWhenUserSet(t *testing.T) {
+	srv := newProxyableTestServer(t, "deployer", "s3cret")
+	if code, _ := fetchManifest(t, srv.URL, "", ""); code != http.StatusUnauthorized {
+		t.Fatalf("GET /-/hub/manifest without credentials: got %d, want 401", code)
+	}
+	if code, _ := fetchManifest(t, srv.URL, "deployer", "s3cret"); code != http.StatusOK {
+		t.Fatalf("GET /-/hub/manifest with credentials: got %d, want 200", code)
+	}
+}
+
+func TestManifestOpenWhenUserEmpty(t *testing.T) {
+	srv := newProxyableTestServer(t, "", "")
+	if code, _ := fetchManifest(t, srv.URL, "", ""); code != http.StatusOK {
+		t.Fatalf("GET /-/hub/manifest with no -user configured: got %d, want 200", code)
+	}
+}
+
+func TestManifestListsAllFiles(t *testing.T) {
+	srv := newProxyableTestServer(t, "deployer", "s3cret")
+	mustPut(t, srv.URL, snapDir+"/x.jar", "data")
+
+	// x.jar doesn't match the snapshot filename convention (no
+	// -SNAPSHOT/timestamped suffix on the base name), so only the
+	// artifact-level metadata one level up gets (re)generated -- not
+	// version-level snapshot metadata. See regenSnapshot in main.go.
+	_, paths := fetchManifest(t, srv.URL, "deployer", "s3cret")
+	want := map[string]bool{
+		snapDir + "/x.jar":                        false,
+		"com/example/mylib/maven-metadata.xml":     false,
+		"com/example/mylib/maven-metadata.xml.md5": false,
+	}
+	for _, p := range paths {
+		if _, ok := want[p]; ok {
+			want[p] = true
+		}
+	}
+	for p, found := range want {
+		if !found {
+			t.Errorf("manifest missing expected path %q (got %v)", p, paths)
 		}
 	}
 }

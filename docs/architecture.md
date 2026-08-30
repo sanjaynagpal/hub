@@ -13,10 +13,10 @@ Host Maven artifacts that aren't available from public repositories (Maven
 Central, etc.) — third-party downloads an operator has vetted, such as an
 Erlang/OTP release published under a `groupId`/`artifactId` this org
 controls. It is explicitly **not** a general-purpose artifact repository
-manager: no proxying/caching of upstream repos, no UI, no RBAC, no support
-for arbitrary `mvn deploy` traffic at scale. Where those are needed, the
-recommendation is Sonatype Nexus or a similar tool (see
-[`maven-repo-runbook.md`](maven-repo-runbook.md)).
+manager: no proxying/caching of *public* upstream repos like Maven Central,
+no UI, no RBAC, no support for arbitrary `mvn deploy` traffic at scale.
+Where those are needed, the recommendation is Sonatype Nexus or a similar
+tool (see [`maven-repo-runbook.md`](maven-repo-runbook.md)).
 
 ## 2. Goals / non-goals
 
@@ -33,7 +33,12 @@ recommendation is Sonatype Nexus or a similar tool (see
 **Non-goals**
 - Accepting routine `mvn deploy` traffic from CI or developer machines (see
   §6, this was considered and rejected for this deployment).
-- Proxying or mirroring upstream repositories.
+- Running as a Hub Proxy or Hub Mirror (`-upstream`/`-mirror`) — this is a
+  deployment choice, not a software limitation: `mavenrepo` gained a general
+  Hub Proxy/Mirror capability (see the README's "Proxy mode"/"Mirror mode"
+  sections and `proxy.go`) after this document was first written, but
+  `mvn-dev-repo.slab.com` has no upstream Hub to replicate from — it *is*
+  the source of truth — so it stays a plain standalone `-read-only` Hub.
 - Multi-tenancy, RBAC, or a web UI.
 
 ## 3. System context
@@ -81,7 +86,10 @@ deployment uses only the second. §6 covers why.
 
 ### 4.1 `mavenrepo` (the Go binary)
 
-Single file (`main.go`, ~580 lines), standard library only. One
+Standard library only, no third-party dependencies. This deployment only
+exercises `main.go` (standalone/hub mode) — the binary also has a sibling
+`proxy.go` implementing Hub Proxy/Mirror mode (`-upstream`/`-mirror`), not
+used on this host; see the non-goals note in §2. In standalone mode, one
 `http.HandlerFunc` dispatches on method:
 
 | Method | Handling |
@@ -273,12 +281,17 @@ by itself open a write path.
   support is expected on this host at all, or whether it's dead weight for
   this particular deployment.
 - **No automated test coverage for the Ansible layer**: `go test ./...`
-  covers `main.go` (11 tests: auth, read-only rejection, metadata
+  covers `main.go`/`main_test.go` (auth, read-only rejection, metadata
   regeneration incl. the direct-placement `-regen` path, checksum
-  consistency, path-traversal safety, version comparison) and
-  `cmd/acmeclient` (JWS/JWK correctness, an end-to-end issuance against a
-  mock ACME server with real signature verification, and the expiry/notify/
-  `-force` renewal logic from §4.5). The playbooks themselves have been
+  consistency, path-traversal safety, version comparison, and the
+  `/-/hub/events`/`/-/hub/manifest` endpoints Hub Proxy/Mirror mode
+  depends on), `proxy.go`/`proxy_test.go` (fetch-through caching,
+  singleflight collapsing, event-driven invalidation, and mirror-mode
+  full sync/reconciliation — none of it exercised by this deployment, see
+  §2), and `cmd/acmeclient` (JWS/JWK correctness, an end-to-end issuance
+  against a mock ACME server with real signature verification, and the
+  expiry/notify/`-force` renewal logic from §4.5). The playbooks themselves
+  have been
   syntax/template-validated but not run against a live host as part of any
   CI.
 - **Single-host by default**, but an opt-in two-backend HA topology now
@@ -296,7 +309,8 @@ by itself open a write path.
 
 | Path | What |
 |---|---|
-| `main.go`, `main_test.go` | The server |
+| `main.go`, `main_test.go` | The server (standalone/hub mode — what this deployment runs) |
+| `proxy.go`, `proxy_test.go` | Hub Proxy/Mirror mode (`-upstream`/`-mirror`) — not used by this deployment, see §2 |
 | `cmd/acmeclient/` | Minimal stdlib-only ACME (RFC 8555) client that provisions the nginx front's TLS cert from the internal CA |
 | `README.md` | User-facing usage, flags, build/run instructions |
 | `docs/maven-repo-runbook.md` | Broader comparison vs. Jetty/Nexus — background for scope decisions |

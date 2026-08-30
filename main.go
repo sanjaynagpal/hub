@@ -18,16 +18,20 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/subtle"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"flag"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -42,6 +46,10 @@ var (
 	repoRoot      string
 	mu            sync.Mutex // serializes writes + metadata regeneration
 	maxUploadSize int64      // 0 = unlimited; set from -max-upload-size in main()
+
+	// eventsBroadcaster is non-nil only under -allow-proxies. Broadcasting
+	// through a nil receiver is a deliberate no-op (see (*eventBroadcaster).broadcast).
+	eventsBroadcaster *eventBroadcaster
 )
 
 func main() {
@@ -54,6 +62,15 @@ func main() {
 	readOnly := flag.Bool("read-only", false, "reject PUT/DELETE outright (405), regardless of credentials -- for repos populated out-of-band instead of via mvn deploy")
 	regen := flag.String("regen", "", "regenerate maven-metadata.xml for the given version directory (path relative to -root) and exit immediately, without starting the server -- use after placing artifact files directly on disk")
 	maxUploadFlag := flag.Int64("max-upload-size", 500*1024*1024, "maximum PUT request body size in bytes, enforced by the server itself regardless of any reverse-proxy limit (0 = unlimited)")
+	allowProxies := flag.Bool("allow-proxies", false, "expose GET /-/hub/events, a long-lived stream of change notifications for Hub Proxy instances (see -upstream)")
+	upstream := flag.String("upstream", "", "run as a Hub Proxy: upstream Hub base URL to cache from and receive change notifications from. Switches into proxy mode -- PUT/DELETE always rejected")
+	upstreamUser := flag.String("upstream-user", "", "username for authenticating to -upstream (independent of -user/-pass, which gate this proxy's own clients)")
+	upstreamPass := flag.String("upstream-pass", "", "password for authenticating to -upstream")
+	upstreamPassFile := flag.String("upstream-pass-file", "", "path to a file containing the -upstream password; overrides -upstream-pass")
+	syncInterval := flag.Duration("sync-interval", 60*time.Second, "poll-fallback interval used only while the push event stream to -upstream is disconnected")
+	joinTimeout := flag.Duration("join-timeout", 30*time.Second, "how long to wait for the initial connection to -upstream before giving up and exiting")
+	mirror := flag.Bool("mirror", false, "requires -upstream: eagerly pull and keep a complete copy of the upstream, not just what's requested (a Hub Mirror, vs. a lazily-caching Hub Proxy)")
+	mirrorConcurrency := flag.Int("mirror-concurrency", 8, "requires -mirror: how many files to fetch in parallel during a full sync pass")
 	flag.Parse()
 	maxUploadSize = *maxUploadFlag
 
@@ -66,8 +83,21 @@ func main() {
 	}
 	repoRoot = abs
 
+	if *upstream != "" && *regen != "" {
+		log.Fatalf("-upstream cannot be combined with -regen")
+	}
+	if *upstream != "" && *readOnly {
+		log.Fatalf("-upstream cannot be combined with -read-only (proxy mode is always read-only)")
+	}
+	if *upstream != "" && *allowProxies {
+		log.Fatalf("-upstream cannot be combined with -allow-proxies (proxy chaining is not supported)")
+	}
+	if *mirror && *upstream == "" {
+		log.Fatalf("-mirror requires -upstream")
+	}
+
 	if *regen != "" {
-		target, ok := safePath("/" + *regen)
+		target, ok := safePath(repoRoot, "/"+*regen)
 		if !ok {
 			log.Fatalf("-regen path escapes -root")
 		}
@@ -78,15 +108,54 @@ func main() {
 		return
 	}
 
+	if *upstream != "" {
+		upstreamURL, err := url.Parse(*upstream)
+		if err != nil || (upstreamURL.Scheme != "http" && upstreamURL.Scheme != "https") || upstreamURL.Host == "" {
+			log.Fatalf("-upstream must be an http(s) URL: %v", err)
+		}
+		resolvedUpstreamPass, err := resolvePassword(*upstreamPass, *upstreamPassFile)
+		if err != nil {
+			log.Fatalf("reading upstream-pass-file: %v", err)
+		}
+		resolvedPass, err := resolvePassword(*pass, *passFile)
+		if err != nil {
+			log.Fatalf("reading pass-file: %v", err)
+		}
+
+		px := newProxyState(repoRoot, upstreamURL, *upstreamUser, resolvedUpstreamPass, *syncInterval, *mirror, *mirrorConcurrency)
+		log.Printf("joining upstream %s (timeout %s)...", upstreamURL, *joinTimeout)
+		bgCtx := context.Background()
+		if err := px.join(bgCtx, *joinTimeout); err != nil {
+			log.Fatalf("joining upstream: %v", err)
+		}
+		px.startBackgroundSync(bgCtx)
+		if *mirror {
+			log.Printf("hub mirror replicating %s from %s, serving on %s", repoRoot, upstreamURL, *addr)
+		} else {
+			log.Printf("hub proxy caching %s from %s, serving on %s", repoRoot, upstreamURL, *addr)
+		}
+		srv := &http.Server{
+			Addr:              *addr,
+			Handler:           newProxyHandler(px, *user, resolvedPass, *readAuth),
+			ReadHeaderTimeout: 10 * time.Second,
+			IdleTimeout:       120 * time.Second,
+		}
+		log.Fatal(srv.ListenAndServe())
+	}
+
 	resolvedPass, err := resolvePassword(*pass, *passFile)
 	if err != nil {
 		log.Fatalf("reading pass-file: %v", err)
 	}
 
+	if *allowProxies {
+		eventsBroadcaster = newEventBroadcaster()
+	}
+
 	log.Printf("maven repo serving %s on %s (snapshot-aware metadata enabled)", repoRoot, *addr)
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: newHandler(*user, resolvedPass, *readAuth, *readOnly),
+		Handler: newHandler(*user, resolvedPass, *readAuth, *readOnly, *allowProxies),
 		// ReadHeaderTimeout guards against slowloris-style connections that
 		// trickle headers in to hold a connection open indefinitely.
 		// ReadTimeout/WriteTimeout are deliberately left unset: they'd bound
@@ -100,9 +169,17 @@ func main() {
 }
 
 // newHandler builds the HTTP handler. repoRoot must be set before calling.
-func newHandler(user, pass string, readAuth, readOnly bool) http.Handler {
+func newHandler(user, pass string, readAuth, readOnly, allowProxies bool) http.Handler {
 	fileServer := http.FileServer(http.Dir(repoRoot))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if allowProxies && r.Method == http.MethodGet && r.URL.Path == "/-/hub/events" {
+			handleEvents(w, r, user, pass)
+			return
+		}
+		if allowProxies && r.Method == http.MethodGet && r.URL.Path == "/-/hub/manifest" {
+			handleManifest(w, r, user, pass)
+			return
+		}
 		isWrite := r.Method == http.MethodPut || r.Method == http.MethodDelete
 		if readOnly && isWrite {
 			http.Error(w, "repository is read-only", http.StatusMethodNotAllowed)
@@ -127,10 +204,10 @@ func newHandler(user, pass string, readAuth, readOnly bool) http.Handler {
 }
 
 // safePath maps a request path to an absolute path guaranteed to stay under root.
-func safePath(urlPath string) (string, bool) {
+func safePath(root, urlPath string) (string, bool) {
 	clean := filepath.Clean("/" + strings.TrimPrefix(urlPath, "/"))
-	full := filepath.Join(repoRoot, clean)
-	if full != repoRoot && !strings.HasPrefix(full, repoRoot+string(os.PathSeparator)) {
+	full := filepath.Join(root, clean)
+	if full != root && !strings.HasPrefix(full, root+string(os.PathSeparator)) {
 		return "", false
 	}
 	return full, true
@@ -145,7 +222,7 @@ func writeError(w http.ResponseWriter, r *http.Request, status int, msg string, 
 }
 
 func handlePut(w http.ResponseWriter, r *http.Request) {
-	full, ok := safePath(r.URL.Path)
+	full, ok := safePath(repoRoot, r.URL.Path)
 	if !ok {
 		http.Error(w, "bad path", http.StatusBadRequest)
 		return
@@ -198,7 +275,7 @@ func handlePut(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleDelete(w http.ResponseWriter, r *http.Request) {
-	full, ok := safePath(r.URL.Path)
+	full, ok := safePath(repoRoot, r.URL.Path)
 	if !ok {
 		http.Error(w, "bad path", http.StatusBadRequest)
 		return
@@ -209,6 +286,7 @@ func handleDelete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, r, http.StatusNotFound, "not found", err)
 		return
 	}
+	broadcastChanged(filepath.Dir(full))
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -234,6 +312,165 @@ func authOK(r *http.Request, user, pass string) bool {
 	}
 	return subtle.ConstantTimeCompare([]byte(u), []byte(user)) == 1 &&
 		subtle.ConstantTimeCompare([]byte(p), []byte(pass)) == 1
+}
+
+// ---- proxy change notifications --------------------------------------------
+
+const (
+	eventBufferSize   = 8
+	keepAliveInterval = 20 * time.Second
+)
+
+// hubEvent is pushed over GET /-/hub/events as one NDJSON line. Dir is a
+// POSIX path relative to repoRoot; empty on a "ping" keep-alive.
+type hubEvent struct {
+	Type string `json:"type"` // "changed" | "ping"
+	Dir  string `json:"dir,omitempty"`
+}
+
+// eventBroadcaster fans out hubEvents to every connected Hub Proxy. Its
+// mutex is independent of the package-level mu (which only serializes
+// filesystem writes) -- broadcasting never touches mu, so there's no
+// lock-ordering hazard calling broadcast while mu is already held.
+type eventBroadcaster struct {
+	mu   sync.Mutex
+	next uint64
+	subs map[uint64]chan hubEvent
+}
+
+func newEventBroadcaster() *eventBroadcaster {
+	return &eventBroadcaster{subs: make(map[uint64]chan hubEvent)}
+}
+
+func (b *eventBroadcaster) subscribe() (uint64, chan hubEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	id := b.next
+	b.next++
+	ch := make(chan hubEvent, eventBufferSize)
+	b.subs[id] = ch
+	return id, ch
+}
+
+func (b *eventBroadcaster) unsubscribe(id uint64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if ch, ok := b.subs[id]; ok {
+		delete(b.subs, id)
+		close(ch)
+	}
+}
+
+// broadcast delivers ev to every subscriber without blocking. A subscriber
+// too slow to keep its buffer drained is dropped (and its channel closed)
+// rather than allowed to stall this call -- a stuck Hub Proxy connection
+// must never delay a write on the hub itself. Dropped proxies catch up via
+// their own poll fallback.
+func (b *eventBroadcaster) broadcast(ev hubEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for id, ch := range b.subs {
+		select {
+		case ch <- ev:
+		default:
+			delete(b.subs, id)
+			close(ch)
+		}
+	}
+}
+
+// broadcastChanged notifies connected Hub Proxies that dir (an absolute
+// path under repoRoot) changed. A no-op when -allow-proxies isn't set.
+func broadcastChanged(dir string) {
+	if eventsBroadcaster == nil {
+		return
+	}
+	rel, err := filepath.Rel(repoRoot, dir)
+	if err != nil {
+		return
+	}
+	eventsBroadcaster.broadcast(hubEvent{Type: "changed", Dir: filepath.ToSlash(rel)})
+}
+
+// handleEvents serves GET /-/hub/events: a long-lived NDJSON stream of
+// hubEvents. Always requires user/pass when user is set, regardless of
+// -read-auth -- joining is a privileged, resource-consuming action, not an
+// anonymous read.
+func handleEvents(w http.ResponseWriter, r *http.Request, user, pass string) {
+	if !authOK(r, user, pass) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="maven"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	id, ch := eventsBroadcaster.subscribe()
+	defer eventsBroadcaster.unsubscribe(id)
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.WriteHeader(http.StatusOK)
+	flusher.Flush()
+
+	ticker := time.NewTicker(keepAliveInterval)
+	defer ticker.Stop()
+
+	enc := json.NewEncoder(w)
+	for {
+		select {
+		case ev, ok := <-ch:
+			if !ok { // dropped as a slow subscriber
+				return
+			}
+			if err := enc.Encode(ev); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-ticker.C:
+			if err := enc.Encode(hubEvent{Type: "ping"}); err != nil {
+				return
+			}
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// manifestEntry is one line of GET /-/hub/manifest's NDJSON response.
+type manifestEntry struct {
+	Path string `json:"path"` // POSIX-relative to repoRoot
+}
+
+// handleManifest serves GET /-/hub/manifest: an NDJSON listing of every
+// regular file under repoRoot (metadata and checksum sidecars included --
+// a Hub Mirror wants a byte-identical copy of the whole tree, not a
+// curated "real artifacts only" view). Same auth rule as handleEvents:
+// always required when user is set, regardless of -read-auth. Unlike
+// /-/hub/events this is a normal bounded request/response, not a
+// long-lived stream.
+func handleManifest(w http.ResponseWriter, r *http.Request, user, pass string) {
+	if !authOK(r, user, pass) {
+		w.Header().Set("WWW-Authenticate", `Basic realm="maven"`)
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	enc := json.NewEncoder(w)
+	filepath.WalkDir(repoRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(repoRoot, path)
+		if err != nil {
+			return nil
+		}
+		enc.Encode(manifestEntry{Path: filepath.ToSlash(rel)})
+		return nil
+	})
 }
 
 // ---- metadata regeneration -------------------------------------------------
@@ -266,6 +503,7 @@ func regenerateForVersionDir(verDir string) {
 		regenSnapshot(verDir)
 	}
 	regenArtifact(filepath.Dir(verDir))
+	broadcastChanged(verDir)
 }
 
 // regenerateForDir refreshes metadata appropriate to dir, used when a client tries
@@ -277,9 +515,11 @@ func regenerateForDir(dir string) {
 	if strings.HasSuffix(filepath.Base(dir), "-SNAPSHOT") {
 		regenSnapshot(dir)
 		regenArtifact(filepath.Dir(dir))
+		broadcastChanged(dir)
 		return
 	}
 	regenArtifact(dir)
+	broadcastChanged(dir)
 }
 
 // coordsForVersionDir returns groupId, artifactId, version for a version dir.

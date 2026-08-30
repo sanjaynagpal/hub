@@ -4,11 +4,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-`hub` (module `github.com/sanjaynagpal/hub`) is a single-file Maven repository
-server written in Go, standard library only — no third-party dependencies.
-Everything the server needs lives in `main.go` (~620 lines) plus
-`main_test.go`; read `main.go` directly rather than hunting through an
-`internal/`/`pkg/` layout, since there isn't one.
+`hub` (module `github.com/sanjaynagpal/hub`) is a Maven repository server
+written in Go, standard library only — no third-party dependencies. The
+standalone/hub-mode server lives in `main.go` plus `main_test.go`; Hub Proxy
+mode (a read-through cache in front of another Hub — see "Hub Proxy mode"
+below) is a second, self-contained concern kept in a sibling file,
+`proxy.go` plus `proxy_test.go`, same package `main`, same binary. Read
+these directly rather than hunting through an `internal/`/`pkg/` layout,
+since there isn't one.
 
 The one other Go package in this repo is `cmd/acmeclient/` — a small,
 independent, stdlib-only ACME (RFC 8555) client that provisions the TLS
@@ -75,6 +78,68 @@ regeneration so concurrent `mvn deploy`s can't race the snapshot build number).
 `filepath.Clean`s and joins against `repoRoot`, then verifies the result is
 still under `repoRoot` before any file I/O — this is the sole path-traversal
 guard and any new handler touching the filesystem must go through it.
+
+Two flags change the write path's shape: `-read-only` rejects `PUT`/`DELETE`
+outright (405) regardless of credentials, for repos populated out-of-band
+instead of via `mvn deploy`; `-regen <version-dir>` runs metadata
+regeneration for one version directory and exits without starting the
+server, for artifacts placed on disk directly (the read-only counterpart to
+a normal `PUT` triggering regeneration). Both are covered in
+`docs/operator-runbook.md`.
+
+`safePath(root, urlPath string) (string, bool)` takes an explicit root
+rather than reading the `repoRoot` package global — needed so a Hub Proxy's
+own cache root and a standalone Hub's `repoRoot` can coexist in the same
+process (chiefly for tests that run both in one binary). `newHandler` takes
+a 5th `allowProxies bool` param; when true it serves `GET /-/hub/events` (a
+long-lived NDJSON stream of change notifications, see below) ahead of the
+normal file-serving path.
+
+### Hub Proxy mode (`proxy.go`)
+
+`-upstream <url>` switches the binary into a **Hub Proxy**: a read-through
+cache in front of another Hub. It serves `GET`/`HEAD` from its own
+`-root` when cached, otherwise fetches-and-caches from `-upstream` (a
+hand-rolled singleflight collapses concurrent misses of the same path into
+one upstream fetch — no third-party dependency); `PUT`/`DELETE` always 405.
+It must complete an initial connection to the upstream's
+`GET /-/hub/events` (gated by `-allow-proxies` on the upstream) within
+`-join-timeout` before it starts serving at all (`main()` `log.Fatal`s
+otherwise) — but a later disconnect degrades to serving possibly-stale
+cached content, not failing requests. Staleness is bounded two ways: the
+event stream invalidates affected cache entries the instant the upstream
+changes (mirroring `regenerateForVersionDir`'s own "walk up" shape as
+deletion instead of regeneration), and a `-sync-interval` poll fallback
+re-validates cached `maven-metadata.xml` files only while that stream is
+down. See the README's "Proxy mode" section for the full flag list.
+
+One Windows-specific wrinkle worth knowing if touching `proxy.go`:
+`invalidate`'s `os.RemoveAll` and the cache-fill `os.Rename` both retry
+briefly (`removeRetry`/`renameRetry`) against a transient sharing-violation
+error — something else (real-time AV scanning is the common cause) can
+momentarily hold a handle on a just-served cache file exactly when
+invalidation or a rename tries to touch it. This was an actual observed
+source of test flakiness on this repo's native-Windows dev loop, not
+theoretical; don't remove the retry as dead code.
+
+**Mirror mode** (`-mirror`, requires `-upstream`) is a `proxyState` with
+`mirror: true` — it reuses `newProxyHandler`/`serveOrFetch`/
+`fetchAndCache`/`invalidate`/the event loop completely unchanged (a
+mirror's cache-miss and event-invalidation behavior is identical to a
+plain proxy's). What it adds: `startBackgroundSync` additionally launches
+`runFullSync` (one eager `reconcileWithManifest` pass right after join) and
+`runMirrorPollFallback` (the same ticker/`connected`-gated shape as
+`runPollFallback`, but calling `reconcileWithManifest` instead of
+`pollOnce`). `reconcileWithManifest` fetches the hub-side
+`GET /-/hub/manifest` endpoint (`handleManifest` in main.go, gated by
+`-allow-proxies` exactly like `/-/hub/events` — an NDJSON listing of every
+regular file under `repoRoot`, metadata/checksums included) and reconciles:
+fetches anything missing locally (bounded by `-mirror-concurrency`), and
+`removeRetry`s anything local no longer in the manifest (catches an
+upstream deletion that happened during a disconnect). This is the only
+mechanism by which a mirror discovers brand-new upstream artifacts it was
+never asked for — a plain proxy's `pollOnce` can't, since it only
+re-validates paths already cached.
 
 ### Metadata regeneration (the core logic)
 

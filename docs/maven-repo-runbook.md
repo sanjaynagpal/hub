@@ -647,7 +647,9 @@ WantedBy=multi-user.target
 
 > **Snapshot & metadata handling (built in).** After each artifact upload the server regenerates `maven-metadata.xml` from the files on disk — the `<snapshot>` timestamp / `<buildNumber>` and `<snapshotVersions>` for `-SNAPSHOT` versions, and the `<versions>` / `<latest>` / `<release>` list at the artifact level — writes matching `.md5`/`.sha1` checksums, serializes writes with a mutex so concurrent deploys can't race on the build number, and ignores client-uploaded metadata in favour of its own copy. This is the main thing a dumb PUT server gets wrong.
 >
-> **Remaining limitations:** it does not proxy/cache Maven Central, has no web UI or fine-grained RBAC, and rebuilds metadata by scanning the version directory on each write (fine for small/medium repos). Put TLS (nginx/Caddy) in front before exposing it — Basic auth over plaintext is not enough. For the rest, jump to Nexus in Part 2.
+> **Remaining limitations:** it does not proxy/cache *public* repos like Maven Central, has no web UI or fine-grained RBAC, and rebuilds metadata by scanning the version directory on each write (fine for small/medium repos). Put TLS (nginx/Caddy) in front before exposing it — Basic auth over plaintext is not enough. For the rest, jump to Nexus in Part 2.
+>
+> **Hub-to-Hub replication, as of a later revision than the snippet above:** the real repo this snippet is drawn from (`github.com/sanjaynagpal/hub`) has since grown a second mode, in a sibling `proxy.go`, letting one instance of this same binary run as a read-through cache (`-upstream`) or a fully-replicated mirror (`-upstream -mirror`) in front of *another* instance of itself — see that repo's README for `-upstream`/`-mirror`/`-allow-proxies`. This is distinct from proxying Maven Central above: it replicates another Hub, not the public internet, and the standalone snippet in this runbook predates it (this doc is a from-scratch tutorial, not kept in sync with that repo's `main.go`).
 ---
 
 ### Approach B — Embedded Jetty (Java / JVM)

@@ -5,6 +5,11 @@ day to day. For *why* it's built this way, see [`architecture.md`](architecture.
 All commands below assume you're in `deploy/ansible/` on the Ansible control
 node unless stated otherwise.
 
+This host runs standalone (`main.go`), not as a Hub Proxy/Hub Mirror — see
+the README's "Proxy mode"/"Mirror mode" sections if you're setting up a
+*different* host as a read-through cache or full replica of a Hub instead;
+none of the setup below applies to that deployment shape.
+
 ## 1. Prerequisites
 
 On the Ansible control node:
