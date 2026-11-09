@@ -71,6 +71,7 @@ func main() {
 	joinTimeout := flag.Duration("join-timeout", 30*time.Second, "how long to wait for the initial connection to -upstream before giving up and exiting")
 	mirror := flag.Bool("mirror", false, "requires -upstream: eagerly pull and keep a complete copy of the upstream, not just what's requested (a Hub Mirror, vs. a lazily-caching Hub Proxy)")
 	mirrorConcurrency := flag.Int("mirror-concurrency", 8, "requires -mirror: how many files to fetch in parallel during a full sync pass")
+	accessLog := flag.Bool("access-log", true, "log one line per request (remote addr, method, path, status, bytes, duration) -- turn off if something already sits in front of Hub and logs access (e.g. nginx)")
 	flag.Parse()
 	maxUploadSize = *maxUploadFlag
 
@@ -134,9 +135,13 @@ func main() {
 		} else {
 			log.Printf("hub proxy caching %s from %s, serving on %s", repoRoot, upstreamURL, *addr)
 		}
+		var handler http.Handler = newProxyHandler(px, *user, resolvedPass, *readAuth)
+		if *accessLog {
+			handler = accessLogMiddleware(handler)
+		}
 		srv := &http.Server{
 			Addr:              *addr,
-			Handler:           newProxyHandler(px, *user, resolvedPass, *readAuth),
+			Handler:           handler,
 			ReadHeaderTimeout: 10 * time.Second,
 			IdleTimeout:       120 * time.Second,
 		}
@@ -153,9 +158,13 @@ func main() {
 	}
 
 	log.Printf("maven repo serving %s on %s (snapshot-aware metadata enabled)", repoRoot, *addr)
+	var handler http.Handler = newHandler(*user, resolvedPass, *readAuth, *readOnly, *allowProxies)
+	if *accessLog {
+		handler = accessLogMiddleware(handler)
+	}
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: newHandler(*user, resolvedPass, *readAuth, *readOnly, *allowProxies),
+		Handler: handler,
 		// ReadHeaderTimeout guards against slowloris-style connections that
 		// trickle headers in to hold a connection open indefinitely.
 		// ReadTimeout/WriteTimeout are deliberately left unset: they'd bound
@@ -200,6 +209,54 @@ func newHandler(user, pass string, readAuth, readOnly, allowProxies bool) http.H
 		default:
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		}
+	})
+}
+
+// statusWriter wraps http.ResponseWriter to capture the status code and byte
+// count for accessLogMiddleware, without disturbing anything else about the
+// response -- notably it forwards Flush() so a wrapped streaming handler
+// (GET /-/hub/events) still works.
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+	bytes  int64
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.status = code
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+func (sw *statusWriter) Write(b []byte) (int, error) {
+	if sw.status == 0 {
+		sw.status = http.StatusOK
+	}
+	n, err := sw.ResponseWriter.Write(b)
+	sw.bytes += int64(n)
+	return n, err
+}
+
+func (sw *statusWriter) Flush() {
+	if f, ok := sw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// accessLogMiddleware logs one line per request -- the access log Hub itself
+// provides when nothing (e.g. nginx) sits in front of it to log requests
+// instead. For a long-lived stream (GET /-/hub/events) the line is written
+// once the connection closes, covering the connection's full duration and
+// cumulative byte count rather than one line per event.
+func accessLogMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sw := &statusWriter{ResponseWriter: w}
+		start := time.Now()
+		next.ServeHTTP(sw, r)
+		status := sw.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		log.Printf("%s %s %s %d %db %s", r.RemoteAddr, r.Method, r.URL.RequestURI(), status, sw.bytes, time.Since(start).Round(time.Millisecond))
 	})
 }
 

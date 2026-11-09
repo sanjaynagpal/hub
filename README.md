@@ -44,6 +44,7 @@ GOOS=linux  GOARCH=arm64 go build -o mavenrepo-linux-arm64 .
 | `-regen`     | *(empty)* | Regenerate `maven-metadata.xml` for the given version directory (relative to `-root`) and exit, without starting the server — for artifacts placed directly on disk |
 | `-max-upload-size` | `524288000` (500 MiB) | Maximum PUT request body size in bytes, enforced by the server itself regardless of any reverse-proxy limit (`0` = unlimited) |
 | `-allow-proxies` | `false` | Expose `GET /-/hub/events`, a change-notification stream for Hub Proxy instances (see below) |
+| `-access-log` | `true` | Log one line per request (remote addr, method, path, status, bytes, duration) — turn off if something already sits in front of Hub and logs access (e.g. nginx) |
 
 ## Proxy mode
 
@@ -218,9 +219,9 @@ could plant one.
 - Explicit `ReadHeaderTimeout`/`IdleTimeout` on the HTTP server, guarding against slowloris-style connections that hold sockets open by trickling headers in slowly. `ReadTimeout`/`WriteTimeout` are deliberately left unset so they don't cap large legitimate artifact transfers.
 - Error responses to clients are generic; the real error (which can include server-side file paths) is logged server-side only, not returned in the response body.
 - `server_tokens off;` in the shipped nginx configs, so the exact nginx version isn't handed to anyone probing the server.
+- `-access-log` (default on) logs one line per request (remote addr, method, path, status, bytes, duration) — a full audit trail of who read/wrote what even when Hub is reached directly, with nothing in front of it. Turn it off if you'd rather rely solely on a reverse proxy's own access log and avoid logging the same request twice.
 
 **Not implemented, worth knowing about**:
-- No built-in request/access logging beyond the startup line and error paths — rely on nginx's access log (or add your own reverse-proxy logging) for a full audit trail of who read/wrote what.
 - No rate limiting on Basic Auth attempts at the app layer — add `limit_req` at nginx if `-read-only` is off and brute-forcing `-pass` is a real concern for your deployment.
 - Directory listing is on by default (`http.FileServer`'s built-in behavior) — expected for a browsable repo, but confirm that's actually wanted for your deployment; there's no flag to disable it.
 - No `X-Content-Type-Options: nosniff` — mostly relevant if the general-purpose write mode (`-read-only` off) is used by less-trusted principals, since a served `.html` upload could execute inline script for anyone linked directly to it.

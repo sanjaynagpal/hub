@@ -74,6 +74,14 @@ set; comparisons use `crypto/subtle` to stay constant-time. All writes go
 through a single package-level `mu sync.Mutex` (serializes writes and metadata
 regeneration so concurrent `mvn deploy`s can't race the snapshot build number).
 
+Per-request access logging (`-access-log`, on by default) is `accessLogMiddleware`
+wrapping the handler once in `main()`, not part of `newHandler`/`newProxyHandler`
+themselves -- both apply it identically, and tests that construct a handler
+directly (most of `main_test.go`/`proxy_test.go`) exercise the unwrapped handler,
+so they see no access-log output. Its `statusWriter` forwards `Flush()` to the
+underlying `http.ResponseWriter`, which the long-lived `GET /-/hub/events`
+stream depends on.
+
 **Path safety**: every request path is resolved through `safePath`, which
 `filepath.Clean`s and joins against `repoRoot`, then verifies the result is
 still under `repoRoot` before any file I/O — this is the sole path-traversal

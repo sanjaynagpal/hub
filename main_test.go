@@ -2,12 +2,14 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -374,6 +376,39 @@ func TestDeleteErrorDoesNotLeakServerPath(t *testing.T) {
 	if strings.Contains(string(b), repoRoot) {
 		t.Fatalf("error response leaked the server-side repo path: %s", b)
 	}
+}
+
+func TestAccessLogMiddleware(t *testing.T) {
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTeapot)
+		w.Write([]byte("hi"))
+	})
+	req := httptest.NewRequest(http.MethodGet, "/foo/bar", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	rec := httptest.NewRecorder()
+
+	accessLogMiddleware(inner).ServeHTTP(rec, req)
+
+	line := buf.String()
+	for _, want := range []string{"127.0.0.1:12345", "GET", "/foo/bar", "418", "2b"} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("access log line %q missing %q", line, want)
+		}
+	}
+}
+
+func TestAccessLogMiddlewarePreservesFlusher(t *testing.T) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := w.(http.Flusher); !ok {
+			t.Error("ResponseWriter passed through accessLogMiddleware lost http.Flusher")
+		}
+	})
+	req := httptest.NewRequest(http.MethodGet, "/-/hub/events", nil)
+	accessLogMiddleware(inner).ServeHTTP(httptest.NewRecorder(), req)
 }
 
 func TestSafePathContainsTraversal(t *testing.T) {
